@@ -20,8 +20,13 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
             self?.playPauseButton.setTitle(isPlaying ? "Pause" : "Play", for: .normal)
         }
 
-        // Langsung muat daftar lagu populer saat aplikasi dibuka
         performSearch(query: "Lagu Pop Indonesia Hits")
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // Kaitkan WKWebView ke window utama agar pemutaran audio & background mode aktif
+        AudioPlayerManager.shared.attachToWindow(view.window)
     }
 
     private func setupUI() {
@@ -124,13 +129,6 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         let song = songs[indexPath.row]
-        nowPlayingLabel.text = "Memuat stream: \(song.title)..."
-        InnerTubeService.shared.fetchAudioStreamURL(videoId: song.videoId) { [weak self] url, errorMsg in
-            guard let streamURL = url else {
-                self?.nowPlayingLabel.text = "Gagal: \(errorMsg ?? "Stream error")"
-                return
-            }
-            AudioPlayerManager.shared.play(song: song, streamURL: streamURL)
-        }
+        AudioPlayerManager.shared.play(song: song)
     }
 }
