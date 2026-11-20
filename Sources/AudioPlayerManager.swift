@@ -3,7 +3,7 @@ import WebKit
 import AVFoundation
 import MediaPlayer
 
-class AudioPlayerManager: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     static let shared = AudioPlayerManager()
     
     private var webView: WKWebView!
@@ -37,15 +37,15 @@ class AudioPlayerManager: NSObject, WKScriptMessageHandler, WKNavigationDelegate
         }
         
         let contentController = WKUserContentController()
-        contentController.add(self, name: "playerState")
+        contentController.add(self, name: "nativeBridge")
         config.userContentController = contentController
 
-        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: config)
+        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: config)
         webView.navigationDelegate = self
+        // Gunakan User-Agent Safari iOS 12 standar agar YouTube Mobile melayani stream HTML5 langsung
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 12_5_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1.2 Mobile/15E148 Safari/604.1"
     }
 
-    // Tempelkan WebView ke window aktif agar WebKit iOS 12 tidak menangguhkan audio
     func attachToWindow(_ window: UIWindow?) {
         guard let window = window, webView.superview == nil else { return }
         webView.alpha = 0.01
@@ -59,111 +59,94 @@ class AudioPlayerManager: NSObject, WKScriptMessageHandler, WKNavigationDelegate
         updateNowPlayingInfo(song: song)
         onStateChanged?(true, "Memuat: \(song.title)...")
 
-        let html = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>body, html { margin: 0; padding: 0; background: #000; overflow: hidden; }</style>
-        </head>
-        <body>
-            <div id="player"></div>
-            <script>
-                var tag = document.createElement('script');
-                tag.src = "https://www.youtube.com/iframe_api";
-                var firstScriptTag = document.getElementsByTagName('script')[0];
-                firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
-
-                var player;
-                function onYouTubeIframeAPIReady() {
-                    player = new YT.Player('player', {
-                        height: '100',
-                        width: '100',
-                        videoId: '\(song.videoId)',
-                        playerVars: {
-                            'playsinline': 1,
-                            'autoplay': 1,
-                            'controls': 0,
-                            'rel': 0,
-                            'origin': 'https://www.youtube.com'
-                        },
-                        events: {
-                            'onReady': onPlayerReady,
-                            'onStateChange': onPlayerStateChange,
-                            'onError': onPlayerError
-                        }
-                    });
-                }
-
-                function onPlayerReady(event) {
-                    event.target.setVolume(100);
-                    event.target.playVideo();
-                }
-
-                function onPlayerStateChange(event) {
-                    window.webkit.messageHandlers.playerState.postMessage({
-                        type: 'state',
-                        data: event.data
-                    });
-                }
-
-                function onPlayerError(event) {
-                    window.webkit.messageHandlers.playerState.postMessage({
-                        type: 'error',
-                        data: event.data
-                    });
-                }
-            </script>
-        </body>
-        </html>
-        """
-
-        webView.loadHTMLString(html, baseURL: URL(string: "https://www.youtube.com"))
+        // Muat halaman watch langsung (bukan /embed) untuk menghindari blokir hak cipta Error 150/152
+        if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(song.videoId)") {
+            var request = URLRequest(url: watchURL)
+            request.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
+            webView.load(request)
+        }
     }
 
     func togglePlayPause() {
+        guard let song = currentSong else { return }
         if isPlaying {
-            webView.evaluateJavaScript("if(player && player.pauseVideo) player.pauseVideo();", completionHandler: nil)
+            webView.evaluateJavaScript("var v = document.querySelector('video'); if(v) v.pause();", completionHandler: nil)
             isPlaying = false
         } else {
-            webView.evaluateJavaScript("if(player && player.playVideo) player.playVideo();", completionHandler: nil)
+            // Cek apakah elemen video sudah siap; jika belum, muat ulang lagunya
+            webView.evaluateJavaScript("var v = document.querySelector('video'); if(v) { v.play(); 'ok'; } else { 'reload'; }") { [weak self] result, _ in
+                if let res = result as? String, res == "reload" {
+                    self?.play(song: song)
+                }
+            }
             isPlaying = true
         }
-        if let song = currentSong {
-            onStateChanged?(isPlaying, "\(song.title) - \(song.artist)")
-        }
+        updateNowPlayingInfo(song: song)
+        onStateChanged?(isPlaying, "\(song.title) - \(song.artist)")
     }
 
-    // Menerima status dari JavaScript YouTube IFrame API
+    // Setelah halaman m.youtube.com selesai dimuat, paksa elemen <video> berputar dan pantau event-nya
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        let jsHook = """
+        (function() {
+            var attempts = 0;
+            var timer = setInterval(function() {
+                attempts++;
+                var video = document.querySelector('video');
+                if (video) {
+                    clearInterval(timer);
+                    video.muted = false;
+                    video.volume = 1.0;
+                    video.play().catch(function(e) {});
+                    
+                    video.addEventListener('playing', function() {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
+                    });
+                    video.addEventListener('pause', function() {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
+                    });
+                    video.addEventListener('ended', function() {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
+                    });
+                } else if (attempts > 30) {
+                    clearInterval(timer);
+                    window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'timeout' });
+                }
+            }, 300);
+        })();
+        """
+        webView.evaluateJavaScript(jsHook, completionHandler: nil)
+    }
+
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any],
-              let type = body["type"] as? String else { return }
+              let status = body["status"] as? String,
+              let song = currentSong else { return }
 
-        if type == "state", let state = body["data"] as? Int, let song = currentSong {
-            // YT.PlayerState: 1 = PLAYING, 2 = PAUSED, 0 = ENDED
-            if state == 1 {
-                isPlaying = true
-                onStateChanged?(true, "\(song.title) - \(song.artist)")
-                updateNowPlayingInfo(song: song)
-            } else if state == 2 {
-                isPlaying = false
-                onStateChanged?(false, "\(song.title) - \(song.artist)")
-            } else if state == 0 {
-                isPlaying = false
-                onStateChanged?(false, "Selesai: \(song.title)")
-            }
-        } else if type == "error", let code = body["data"] as? Int {
+        switch status {
+        case "playing":
+            isPlaying = true
+            onStateChanged?(true, "\(song.title) - \(song.artist)")
+            updateNowPlayingInfo(song: song)
+        case "paused":
             isPlaying = false
-            onStateChanged?(false, "Error pemutar YouTube (Kode: \(code))")
+            onStateChanged?(false, "\(song.title) - \(song.artist)")
+        case "ended":
+            isPlaying = false
+            onStateChanged?(false, "Selesai: \(song.title)")
+        case "timeout":
+            isPlaying = false
+            onStateChanged?(false, "Gagal memuat pemutar halaman")
+        default:
+            break
         }
     }
 
     private func setupBackgroundObserver() {
-        // Mencegah WKWebView menghentikan audio otomatis saat tombol power ditekan
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                self.webView.evaluateJavaScript("if(player && player.playVideo) player.playVideo();", completionHandler: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                self.webView.evaluateJavaScript("var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
             }
         }
     }
