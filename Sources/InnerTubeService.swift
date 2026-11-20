@@ -10,6 +10,9 @@ class InnerTubeService {
     static let shared = InnerTubeService()
     private init() {}
 
+    // Menyimpan visitorData dari sesi pencarian untuk lolos pengecekan bot
+    private var visitorData: String?
+
     private let webContext: [String: Any] = [
         "client": [
             "clientName": "WEB_REMIX",
@@ -52,6 +55,12 @@ class InnerTubeService {
                 return
             }
 
+            // Tangkap visitorData dari responseContext agar dianggap sesi browser/klien sah
+            if let responseContext = json["responseContext"] as? [String: Any],
+               let vData = responseContext["visitorData"] as? String {
+                self.visitorData = vData
+            }
+
             var results: [SongItem] = []
             var seenIds = Set<String>()
             self.extractSongsRecursively(from: json, results: &results, seenIds: &seenIds)
@@ -68,21 +77,21 @@ class InnerTubeService {
     }
 
     func fetchAudioStreamURL(videoId: String, completion: @escaping (URL?, String?) -> Void) {
-        // Mencoba klien IOS terlebih dahulu karena mengembalikan stream audio/mp4 langsung untuk AVPlayer
-        tryFetchStream(videoId: videoId, clientName: "IOS", clientVersion: "19.29.1", userAgent: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)") { url, err in
+        // Prioritas 1: TVHTML5_SIMPLY_EMBEDDED_PLAYER (bebas poToken & bebas login untuk lagu publik)
+        tryFetchTVEmbedded(videoId: videoId) { url, err in
             if let url = url {
                 completion(url, nil)
             } else {
-                // Fallback ke ANDROID_VR jika klien IOS dibatasi
-                self.tryFetchStream(videoId: videoId, clientName: "ANDROID_VR", clientVersion: "1.56.21", userAgent: "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip") { fallbackURL, fallbackErr in
+                // Prioritas 2: ANDROID_MUSIC dengan visitorData
+                self.tryFetchAndroidMusic(videoId: videoId) { fallbackURL, fallbackErr in
                     completion(fallbackURL, fallbackErr ?? err)
                 }
             }
         }
     }
 
-    private func tryFetchStream(videoId: String, clientName: String, clientVersion: String, userAgent: String, completion: @escaping (URL?, String?) -> Void) {
-        guard let url = URL(string: "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false") else {
+    private func tryFetchTVEmbedded(videoId: String, completion: @escaping (URL?, String?) -> Void) {
+        guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
             completion(nil, "URL player salah")
             return
         }
@@ -90,16 +99,70 @@ class InnerTubeService {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version", forHTTPHeaderField: "User-Agent")
+        if let vData = visitorData {
+            request.setValue(vData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+        }
+
+        var clientDict: [String: Any] = [
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientVersion": "2.0",
+            "hl": "id",
+            "gl": "ID"
+        ]
+        if let vData = visitorData {
+            clientDict["visitorData"] = vData
+        }
 
         let body: [String: Any] = [
             "context": [
-                "client": [
-                    "clientName": clientName,
-                    "clientVersion": clientVersion,
-                    "hl": "id",
-                    "gl": "ID"
+                "client": clientDict,
+                "thirdParty": [
+                    "embedUrl": "https://www.youtube.com/"
                 ]
+            ],
+            "videoId": videoId,
+            "playbackContext": [
+                "contentPlaybackContext": [
+                    "html5Preference": "HTML5_PREF_WANTS"
+                ]
+            ],
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        executePlayerRequest(request: request, completion: completion)
+    }
+
+    private func tryFetchAndroidMusic(videoId: String, completion: @escaping (URL?, String?) -> Void) {
+        guard let url = URL(string: "https://music.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+            completion(nil, "URL player salah")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("com.google.android.apps.youtube.music/7.03.52 (Linux; U; Android 14) gzip", forHTTPHeaderField: "User-Agent")
+        if let vData = visitorData {
+            request.setValue(vData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+        }
+
+        var clientDict: [String: Any] = [
+            "clientName": "ANDROID_MUSIC",
+            "clientVersion": "7.03.52",
+            "androidSdkVersion": 34,
+            "hl": "id",
+            "gl": "ID"
+        ]
+        if let vData = visitorData {
+            clientDict["visitorData"] = vData
+        }
+
+        let body: [String: Any] = [
+            "context": [
+                "client": clientDict
             ],
             "videoId": videoId,
             "contentCheckOk": true,
@@ -107,7 +170,10 @@ class InnerTubeService {
         ]
 
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        executePlayerRequest(request: request, completion: completion)
+    }
 
+    private func executePlayerRequest(request: URLRequest, completion: @escaping (URL?, String?) -> Void) {
         URLSession.shared.dataTask(with: request) { data, _, error in
             if let error = error {
                 DispatchQueue.main.async { completion(nil, error.localizedDescription) }
@@ -136,7 +202,7 @@ class InnerTubeService {
                     }
                 }
 
-                // Prioritas 2: format mp4 gabungan apa pun jika audio-only tidak tersedia
+                // Prioritas 2: format mp4 gabungan jika audio-only membutuhkan cipher
                 for format in allFormats {
                     if let mimeType = format["mimeType"] as? String,
                        mimeType.contains("video/mp4"),
