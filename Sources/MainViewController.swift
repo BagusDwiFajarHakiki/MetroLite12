@@ -19,6 +19,9 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
             self?.nowPlayingLabel.text = title
             self?.playPauseButton.setTitle(isPlaying ? "Pause" : "Play", for: .normal)
         }
+
+        // Langsung muat daftar lagu populer saat aplikasi dibuka
+        performSearch(query: "Lagu Pop Indonesia Hits")
     }
 
     private func setupUI() {
@@ -39,7 +42,7 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
         playerBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(playerBar)
 
-        nowPlayingLabel.text = "Belum ada lagu diputar"
+        nowPlayingLabel.text = "Memuat katalog..."
         nowPlayingLabel.textColor = .white
         nowPlayingLabel.font = UIFont.systemFont(ofSize: 13, weight: .medium)
         nowPlayingLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -81,18 +84,24 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
         AudioPlayerManager.shared.togglePlayPause()
     }
 
+    private func performSearch(query: String) {
+        nowPlayingLabel.text = "Mencari: \(query)..."
+        InnerTubeService.shared.searchSongs(query: query) { [weak self] results, errorMsg in
+            self?.songs = results
+            self?.tableView.reloadData()
+            if let errorMsg = errorMsg {
+                self?.nowPlayingLabel.text = errorMsg
+            } else if AudioPlayerManager.shared.currentSong == nil {
+                self?.nowPlayingLabel.text = "Ditemukan \(results.count) lagu"
+            }
+        }
+    }
+
     // MARK: - UISearchBarDelegate
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
         searchBar.resignFirstResponder()
         guard let query = searchBar.text, !query.isEmpty else { return }
-        nowPlayingLabel.text = "Mencari..."
-        InnerTubeService.shared.searchSongs(query: query) { [weak self] results in
-            self?.songs = results
-            self?.tableView.reloadData()
-            if AudioPlayerManager.shared.currentSong == nil {
-                self?.nowPlayingLabel.text = "Pilih lagu untuk diputar"
-            }
-        }
+        performSearch(query: query)
     }
 
     // MARK: - UITableViewDataSource & Delegate
@@ -116,9 +125,9 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
         tableView.deselectRow(at: indexPath, animated: true)
         let song = songs[indexPath.row]
         nowPlayingLabel.text = "Memuat stream: \(song.title)..."
-        InnerTubeService.shared.fetchAudioStreamURL(videoId: song.videoId) { [weak self] url in
+        InnerTubeService.shared.fetchAudioStreamURL(videoId: song.videoId) { [weak self] url, errorMsg in
             guard let streamURL = url else {
-                self?.nowPlayingLabel.text = "Gagal mengambil stream audio"
+                self?.nowPlayingLabel.text = "Gagal: \(errorMsg ?? "Stream error")"
                 return
             }
             AudioPlayerManager.shared.play(song: song, streamURL: streamURL)
