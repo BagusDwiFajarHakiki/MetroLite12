@@ -12,7 +12,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private var isPlayerPageLoaded = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     
-    var onStateChanged: ((Bool, String) -> Void)?
+    var onStateChanged: ((Bool, String, UIImage?) -> Void)?
+    private var currentArtworkImage: UIImage?
 
     private override init() {
         super.init()
@@ -42,9 +43,15 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let contentController = WKUserContentController()
         contentController.add(self, name: "nativeBridge")
 
-        // 1. Palsukan Page Visibility API sejak awal (.atDocumentStart) agar YouTube tidak menjeda video saat layar dikunci
-        let antiBackgroundPauseJS = """
+        // 1. Kunci kualitas video ke 144p ('tiny') untuk hemat kuota & palsukan Visibility API agar jalan di background
+        let startJS = """
         (function() {
+            try {
+                var exp = Date.now() + 2592000000;
+                localStorage.setItem('yt-player-quality', JSON.stringify({ data: 'tiny', expiration: exp, creation: Date.now() }));
+                localStorage.setItem('yt-player-av1-pref', '144');
+            } catch(e) {}
+
             Object.defineProperty(document, 'hidden', { get: function() { return false; } });
             Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; } });
             Object.defineProperty(document, 'webkitHidden', { get: function() { return false; } });
@@ -60,32 +67,47 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.addEventListener('pagehide', function(e) { e.stopImmediatePropagation(); }, true);
         })();
         """
-        let startScript = WKUserScript(source: antiBackgroundPauseJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        let startScript = WKUserScript(source: startJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(startScript)
 
-        // 2. Pantau elemen <video> dan otomatis lanjutkan jika dijeda oleh sistem saat layar mati
-        let videoHookJS = """
+        // 2. Paksa resolusi terendah pada player internal YouTube & sinkronkan status audio berjalan
+        let endJS = """
         (function() {
             window.__userPaused = false;
+            window.__reportedPlayingForSrc = "";
+            
             setInterval(function() {
+                var player = document.getElementById('movie_player');
+                if (player && player.setPlaybackQualityRange) {
+                    try { player.setPlaybackQualityRange('tiny', 'tiny'); } catch(e) {}
+                }
+
                 var video = document.querySelector('video');
-                if (video && !video.__hooked) {
+                if (!video) return;
+
+                if (!window.__userPaused) {
+                    if (video.muted) video.muted = false;
+                    if (video.volume < 1.0) video.volume = 1.0;
+                    if (video.paused && !video.ended && video.readyState >= 2) {
+                        video.play().catch(function(e) {});
+                    }
+                    if (!video.paused && video.readyState >= 3 && video.currentTime > 0.05) {
+                        var sig = video.src + "_" + Math.floor(video.duration || 0);
+                        if (window.__reportedPlayingForSrc !== sig) {
+                            window.__reportedPlayingForSrc = sig;
+                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
+                        }
+                    }
+                }
+
+                if (!video.__hooked) {
                     video.__hooked = true;
-                    video.muted = false;
-                    video.volume = 1.0;
-                    video.play().catch(function(e) {});
-                    
-                    video.addEventListener('playing', function() {
-                        window.__userPaused = false;
-                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
-                    });
                     video.addEventListener('pause', function() {
-                        // Jika user tidak menekan tombol pause manual, paksa lanjutkan pemutaran di background
                         if (!window.__userPaused && !video.ended) {
                             setTimeout(function() {
                                 if (!window.__userPaused) video.play().catch(function(e) {});
                             }, 50);
-                        } else {
+                        } else if (window.__userPaused) {
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
                         }
                     });
@@ -96,15 +118,14 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }, 150);
         })();
         """
-        let endScript = WKUserScript(source: videoHookJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let endScript = WKUserScript(source: endJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         contentController.addUserScript(endScript)
         config.userContentController = contentController
 
-        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: config)
+        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 2, height: 2), configuration: config)
         webView.navigationDelegate = self
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 12_5_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1.2 Mobile/15E148 Safari/604.1"
 
-        // Blokir gambar & font halaman web agar ringan
         let blockRules = """
         [
             {
@@ -122,7 +143,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func attachToWindow(_ window: UIWindow?) {
         guard let window = window, webView.superview == nil else { return }
-        webView.alpha = 0.01
+        webView.alpha = 1.0
         webView.isUserInteractionEnabled = false
         window.addSubview(webView)
     }
@@ -130,14 +151,25 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     func play(song: SongItem) {
         currentSong = song
         isPlaying = true
-        updateNowPlayingInfo(song: song)
-        onStateChanged?(true, "Memuat: \(song.title)...")
-        webView.evaluateJavaScript("window.__userPaused = false;", completionHandler: nil)
+        currentArtworkImage = nil
+        updateNowPlayingInfo(song: song, image: nil)
+        onStateChanged?(true, "Memuat: \(song.title)...", nil)
+        webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = '';", completionHandler: nil)
+
+        // Unduh thumbnail untuk mini-player dan Lock Screen
+        ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
+            guard let self = self, self.currentSong?.videoId == song.videoId else { return }
+            self.currentArtworkImage = image
+            self.updateNowPlayingInfo(song: song, image: image)
+            let statusText = self.isPlaying ? "\(song.title) - \(song.artist)" : "\(song.title)"
+            self.onStateChanged?(self.isPlaying, statusText, image)
+        }
 
         if isPlayerPageLoaded {
             let spaNavigateJS = """
             (function() {
                 window.__userPaused = false;
+                window.__reportedPlayingForSrc = '';
                 var a = document.createElement('a');
                 a.href = '/watch?v=\(song.videoId)';
                 document.body.appendChild(a);
@@ -173,15 +205,15 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             webView.evaluateJavaScript("window.__userPaused = true; var v = document.querySelector('video'); if(v) v.pause();", completionHandler: nil)
             isPlaying = false
         } else {
-            webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v) { v.play(); 'ok'; } else { 'reload'; }") { [weak self] result, _ in
+            webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v) { v.muted = false; v.volume = 1.0; v.play(); 'ok'; } else { 'reload'; }") { [weak self] result, _ in
                 if let res = result as? String, res == "reload" {
                     self?.loadWatchURL(videoId: song.videoId)
                 }
             }
             isPlaying = true
         }
-        updateNowPlayingInfo(song: song)
-        onStateChanged?(isPlaying, "\(song.title) - \(song.artist)")
+        updateNowPlayingInfo(song: song, image: currentArtworkImage)
+        onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -192,21 +224,20 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         switch status {
         case "playing":
             isPlaying = true
-            onStateChanged?(true, "\(song.title) - \(song.artist)")
-            updateNowPlayingInfo(song: song)
+            onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
             isPlaying = false
-            onStateChanged?(false, "\(song.title) - \(song.artist)")
+            onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
         case "ended":
             isPlaying = false
-            onStateChanged?(false, "Selesai: \(song.title)")
+            onStateChanged?(false, "Selesai: \(song.title)", currentArtworkImage)
         default:
             break
         }
     }
 
     private func setupLifecycleObservers() {
-        // Aktifkan AudioSession & BackgroundTask tepat sebelum aplikasi masuk background agar WebKit tidak dibekukan
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             try? AVAudioSession.sharedInstance().setActive(true)
@@ -238,11 +269,15 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    private func updateNowPlayingInfo(song: SongItem) {
+    private func updateNowPlayingInfo(song: SongItem, image: UIImage?) {
         var info = [String: Any]()
         info[MPMediaItemPropertyTitle] = song.title
         info[MPMediaItemPropertyArtist] = song.artist
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        if let image = image {
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 

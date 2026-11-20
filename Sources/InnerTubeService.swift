@@ -1,17 +1,45 @@
-import Foundation
+import UIKit
 
 struct SongItem {
     let videoId: String
     let title: String
     let artist: String
+    var thumbnailURL: URL? {
+        return URL(string: "https://i.ytimg.com/vi/\(videoId)/mqdefault.jpg")
+    }
+}
+
+class ImageLoader {
+    static let shared = ImageLoader()
+    private let cache = NSCache<NSString, UIImage>()
+    private init() {
+        cache.countLimit = 60 // Batasi cache maksimal 60 gambar agar RAM iPhone 5s tetap lega
+    }
+
+    func loadImage(from url: URL?, completion: @escaping (UIImage?) -> Void) {
+        guard let url = url else {
+            completion(nil)
+            return
+        }
+        let key = url.absoluteString as NSString
+        if let cached = cache.object(forKey: key) {
+            completion(cached)
+            return
+        }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data, let image = UIImage(data: data) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            self?.cache.setObject(image, forKey: key)
+            DispatchQueue.main.async { completion(image) }
+        }.resume()
+    }
 }
 
 class InnerTubeService {
     static let shared = InnerTubeService()
     private init() {}
-
-    // Menyimpan visitorData dari sesi pencarian untuk lolos pengecekan bot
-    private var visitorData: String?
 
     private let webContext: [String: Any] = [
         "client": [
@@ -55,12 +83,6 @@ class InnerTubeService {
                 return
             }
 
-            // Tangkap visitorData dari responseContext agar dianggap sesi browser/klien sah
-            if let responseContext = json["responseContext"] as? [String: Any],
-               let vData = responseContext["visitorData"] as? String {
-                self.visitorData = vData
-            }
-
             var results: [SongItem] = []
             var seenIds = Set<String>()
             self.extractSongsRecursively(from: json, results: &results, seenIds: &seenIds)
@@ -76,150 +98,6 @@ class InnerTubeService {
         }.resume()
     }
 
-    func fetchAudioStreamURL(videoId: String, completion: @escaping (URL?, String?) -> Void) {
-        // Prioritas 1: TVHTML5_SIMPLY_EMBEDDED_PLAYER (bebas poToken & bebas login untuk lagu publik)
-        tryFetchTVEmbedded(videoId: videoId) { url, err in
-            if let url = url {
-                completion(url, nil)
-            } else {
-                // Prioritas 2: ANDROID_MUSIC dengan visitorData
-                self.tryFetchAndroidMusic(videoId: videoId) { fallbackURL, fallbackErr in
-                    completion(fallbackURL, fallbackErr ?? err)
-                }
-            }
-        }
-    }
-
-    private func tryFetchTVEmbedded(videoId: String, completion: @escaping (URL?, String?) -> Void) {
-        guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
-            completion(nil, "URL player salah")
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version", forHTTPHeaderField: "User-Agent")
-        if let vData = visitorData {
-            request.setValue(vData, forHTTPHeaderField: "X-Goog-Visitor-Id")
-        }
-
-        var clientDict: [String: Any] = [
-            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-            "clientVersion": "2.0",
-            "hl": "id",
-            "gl": "ID"
-        ]
-        if let vData = visitorData {
-            clientDict["visitorData"] = vData
-        }
-
-        let body: [String: Any] = [
-            "context": [
-                "client": clientDict,
-                "thirdParty": [
-                    "embedUrl": "https://www.youtube.com/"
-                ]
-            ],
-            "videoId": videoId,
-            "playbackContext": [
-                "contentPlaybackContext": [
-                    "html5Preference": "HTML5_PREF_WANTS"
-                ]
-            ],
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        ]
-
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        executePlayerRequest(request: request, completion: completion)
-    }
-
-    private func tryFetchAndroidMusic(videoId: String, completion: @escaping (URL?, String?) -> Void) {
-        guard let url = URL(string: "https://music.youtube.com/youtubei/v1/player?prettyPrint=false") else {
-            completion(nil, "URL player salah")
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("com.google.android.apps.youtube.music/7.03.52 (Linux; U; Android 14) gzip", forHTTPHeaderField: "User-Agent")
-        if let vData = visitorData {
-            request.setValue(vData, forHTTPHeaderField: "X-Goog-Visitor-Id")
-        }
-
-        var clientDict: [String: Any] = [
-            "clientName": "ANDROID_MUSIC",
-            "clientVersion": "7.03.52",
-            "androidSdkVersion": 34,
-            "hl": "id",
-            "gl": "ID"
-        ]
-        if let vData = visitorData {
-            clientDict["visitorData"] = vData
-        }
-
-        let body: [String: Any] = [
-            "context": [
-                "client": clientDict
-            ],
-            "videoId": videoId,
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        ]
-
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        executePlayerRequest(request: request, completion: completion)
-    }
-
-    private func executePlayerRequest(request: URLRequest, completion: @escaping (URL?, String?) -> Void) {
-        URLSession.shared.dataTask(with: request) { data, _, error in
-            if let error = error {
-                DispatchQueue.main.async { completion(nil, error.localizedDescription) }
-                return
-            }
-
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                DispatchQueue.main.async { completion(nil, "Respons player kosong") }
-                return
-            }
-
-            if let streamingData = json["streamingData"] as? [String: Any] {
-                let adaptive = streamingData["adaptiveFormats"] as? [[String: Any]] ?? []
-                let formats = streamingData["formats"] as? [[String: Any]] ?? []
-                let allFormats = adaptive + formats
-
-                // Prioritas 1: audio/mp4 (AAC/M4A native iOS)
-                for format in allFormats {
-                    if let mimeType = format["mimeType"] as? String,
-                       mimeType.contains("audio/mp4"),
-                       let urlString = format["url"] as? String,
-                       let streamURL = URL(string: urlString) {
-                        DispatchQueue.main.async { completion(streamURL, nil) }
-                        return
-                    }
-                }
-
-                // Prioritas 2: format mp4 gabungan jika audio-only membutuhkan cipher
-                for format in allFormats {
-                    if let mimeType = format["mimeType"] as? String,
-                       mimeType.contains("video/mp4"),
-                       let urlString = format["url"] as? String,
-                       let streamURL = URL(string: urlString) {
-                        DispatchQueue.main.async { completion(streamURL, nil) }
-                        return
-                    }
-                }
-            }
-
-            let playability = (json["playabilityStatus"] as? [String: Any])?["reason"] as? String ?? "Stream tidak tersedia"
-            DispatchQueue.main.async { completion(nil, playability) }
-        }.resume()
-    }
-
-    // Pemindai rekursif untuk menangkap item lagu dari struktur JSON YouTube Music
     private func extractSongsRecursively(from node: Any, results: inout [SongItem], seenIds: inout Set<String>) {
         if let dict = node as? [String: Any] {
             if let itemRenderer = dict["musicResponsiveListItemRenderer"] as? [String: Any] {
