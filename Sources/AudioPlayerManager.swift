@@ -9,6 +9,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private var webView: WKWebView!
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
+    private var isPlayerPageLoaded = false
     
     var onStateChanged: ((Bool, String) -> Void)?
 
@@ -38,12 +39,55 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         
         let contentController = WKUserContentController()
         contentController.add(self, name: "nativeBridge")
+
+        // 1. Suntikkan pemantau video lebih awal (atDocumentEnd) tanpa menunggu seluruh gambar halaman selesai
+        let earlyHookJS = """
+        (function() {
+            if (window.__metroHookInstalled) return;
+            window.__metroHookInstalled = true;
+            setInterval(function() {
+                var video = document.querySelector('video');
+                if (video && !video.__hooked) {
+                    video.__hooked = true;
+                    video.muted = false;
+                    video.volume = 1.0;
+                    video.play().catch(function(e) {});
+                    
+                    video.addEventListener('playing', function() {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
+                    });
+                    video.addEventListener('pause', function() {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
+                    });
+                    video.addEventListener('ended', function() {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
+                    });
+                }
+            }, 150);
+        })();
+        """
+        let userScript = WKUserScript(source: earlyHookJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        contentController.addUserScript(userScript)
         config.userContentController = contentController
 
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 180), configuration: config)
         webView.navigationDelegate = self
-        // Gunakan User-Agent Safari iOS 12 standar agar YouTube Mobile melayani stream HTML5 langsung
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 12_5_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1.2 Mobile/15E148 Safari/604.1"
+
+        // 2. Blokir gambar & font di halaman web YouTube agar loading audio jauh lebih ringan & cepat
+        let blockRules = """
+        [
+            {
+                "trigger": { "url-filter": ".*", "resource-type": ["image", "font"] },
+                "action": { "type": "block" }
+            }
+        ]
+        """
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "BlockHeavyAssets", encodedContentRuleList: blockRules) { [weak self] ruleList, _ in
+            if let ruleList = ruleList {
+                self?.webView.configuration.userContentController.add(ruleList)
+            }
+        }
     }
 
     func attachToWindow(_ window: UIWindow?) {
@@ -59,12 +103,37 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         updateNowPlayingInfo(song: song)
         onStateChanged?(true, "Memuat: \(song.title)...")
 
-        // Muat halaman watch langsung (bukan /embed) untuk menghindari blokir hak cipta Error 150/152
-        if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(song.videoId)") {
+        // 3. Jika halaman YouTube sudah terbuka sebelumnya, pindah lagu secara internal (SPA) tanpa reload halaman
+        if isPlayerPageLoaded {
+            let spaNavigateJS = """
+            (function() {
+                var a = document.createElement('a');
+                a.href = '/watch?v=\(song.videoId)';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            })();
+            """
+            webView.evaluateJavaScript(spaNavigateJS) { [weak self] _, error in
+                if error != nil {
+                    self?.loadWatchURL(videoId: song.videoId)
+                }
+            }
+        } else {
+            loadWatchURL(videoId: song.videoId)
+        }
+    }
+
+    private func loadWatchURL(videoId: String) {
+        if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(videoId)") {
             var request = URLRequest(url: watchURL)
             request.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
             webView.load(request)
         }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        isPlayerPageLoaded = true
     }
 
     func togglePlayPause() {
@@ -73,49 +142,15 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             webView.evaluateJavaScript("var v = document.querySelector('video'); if(v) v.pause();", completionHandler: nil)
             isPlaying = false
         } else {
-            // Cek apakah elemen video sudah siap; jika belum, muat ulang lagunya
             webView.evaluateJavaScript("var v = document.querySelector('video'); if(v) { v.play(); 'ok'; } else { 'reload'; }") { [weak self] result, _ in
                 if let res = result as? String, res == "reload" {
-                    self?.play(song: song)
+                    self?.loadWatchURL(videoId: song.videoId)
                 }
             }
             isPlaying = true
         }
         updateNowPlayingInfo(song: song)
         onStateChanged?(isPlaying, "\(song.title) - \(song.artist)")
-    }
-
-    // Setelah halaman m.youtube.com selesai dimuat, paksa elemen <video> berputar dan pantau event-nya
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        let jsHook = """
-        (function() {
-            var attempts = 0;
-            var timer = setInterval(function() {
-                attempts++;
-                var video = document.querySelector('video');
-                if (video) {
-                    clearInterval(timer);
-                    video.muted = false;
-                    video.volume = 1.0;
-                    video.play().catch(function(e) {});
-                    
-                    video.addEventListener('playing', function() {
-                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
-                    });
-                    video.addEventListener('pause', function() {
-                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
-                    });
-                    video.addEventListener('ended', function() {
-                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
-                    });
-                } else if (attempts > 30) {
-                    clearInterval(timer);
-                    window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'timeout' });
-                }
-            }, 300);
-        })();
-        """
-        webView.evaluateJavaScript(jsHook, completionHandler: nil)
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -134,9 +169,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         case "ended":
             isPlaying = false
             onStateChanged?(false, "Selesai: \(song.title)")
-        case "timeout":
-            isPlaying = false
-            onStateChanged?(false, "Gagal memuat pemutar halaman")
         default:
             break
         }
