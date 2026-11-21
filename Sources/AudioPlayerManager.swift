@@ -16,6 +16,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     var onStateChanged: ((Bool, String, UIImage?) -> Void)?
     private var currentArtworkImage: UIImage?
+    private var currentPlaybackTime: Double = 0
+    private var currentDuration: Double = 0
 
     private override init() {
         super.init()
@@ -37,7 +39,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    // Menghasilkan WAV senyap 1 detik di memori untuk menjaga sesi audio native tetap terkunci di iOS 12
+    // Menjaga sesi audio native iOS 12 tetap aktif agar tidak terputus saat layar dikunci
     private func setupSilentAnchorPlayer() {
         let sampleRate: Int32 = 8000
         let numSamples: Int32 = 8000
@@ -49,8 +51,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         header.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
         header.append("WAVEfmt ".data(using: .ascii)!)
         header.append(withUnsafeBytes(of: Int32(16).littleEndian) { Data($0) })
-        header.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) }) // PCM
-        header.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) }) // Mono
+        header.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) })
         header.append(withUnsafeBytes(of: sampleRate.littleEndian) { Data($0) })
         header.append(withUnsafeBytes(of: (sampleRate * 2).littleEndian) { Data($0) })
         header.append(withUnsafeBytes(of: Int16(2).littleEndian) { Data($0) })
@@ -81,7 +83,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    // Mempertahankan metadata lagu di Lock Screen & Control Center agar tidak tertimpa WebKit
     private func startNowPlayingKeepAlive() {
         nowPlayingTimer?.invalidate()
         nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -147,6 +148,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         video.play().catch(function(e) {});
                     }
                     if (!video.paused && video.readyState >= 3 && video.currentTime > 0.05) {
+                        window.webkit.messageHandlers.nativeBridge.postMessage({
+                            status: 'progress',
+                            currentTime: video.currentTime || 0,
+                            duration: isFinite(video.duration) ? video.duration : 0
+                        });
                         var sig = video.src + "_" + Math.floor(video.duration || 0);
                         if (window.__reportedPlayingForSrc !== sig) {
                             window.__reportedPlayingForSrc = sig;
@@ -205,6 +211,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentSong = song
         isPlaying = true
         currentArtworkImage = nil
+        currentPlaybackTime = 0
+        currentDuration = 0
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
@@ -276,6 +284,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
               let song = currentSong else { return }
 
         switch status {
+        case "progress":
+            if let ct = body["currentTime"] as? Double { currentPlaybackTime = ct }
+            if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
             isPlaying = true
             updateAnchorState()
@@ -334,6 +345,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         var info = [String: Any]()
         info[MPMediaItemPropertyTitle] = song.title
         info[MPMediaItemPropertyArtist] = song.artist
+        info[MPMediaItemPropertyPlaybackDuration] = currentDuration > 0 ? currentDuration : 180.0
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentPlaybackTime
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
         if let image = image {
             let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
