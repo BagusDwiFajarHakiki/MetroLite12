@@ -8,7 +8,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     private var webView: WKWebView!
     private var silentPlayer: AVAudioPlayer?
-    private var nowPlayingTimer: Timer?
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
     
@@ -37,8 +36,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // Wajib tanpa .mixWithOthers agar Lock Screen iOS 12 mengaktifkan Next/Previous & Artwork
-            try session.setCategory(.playback, mode: .default, options: [])
+            // Wajib pakai .mixWithOthers agar silentPlayer dan WKWebView tidak saling memutus setiap detik
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
@@ -69,35 +68,19 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
         if let player = try? AVAudioPlayer(data: header) {
             player.numberOfLoops = -1
-            player.volume = 0.02
+            player.volume = 0.01
             player.prepareToPlay()
             silentPlayer = player
         }
     }
 
-    private func maintainNativeSession() {
-        guard isPlaying else { return }
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-        try? AVAudioSession.sharedInstance().setActive(true)
-        if silentPlayer?.isPlaying == false {
-            silentPlayer?.play()
-        }
-        if let song = currentSong {
-            updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        }
-    }
-
     private func updateAnchorState() {
         if isPlaying {
-            maintainNativeSession()
-            nowPlayingTimer?.invalidate()
-            nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                self?.maintainNativeSession()
+            if silentPlayer?.isPlaying == false {
+                silentPlayer?.play()
             }
         } else {
             silentPlayer?.pause()
-            nowPlayingTimer?.invalidate()
-            nowPlayingTimer = nil
         }
     }
 
@@ -233,7 +216,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         }
                     });
                 }
-            }, 200);
+            }, 250);
         })();
         """
         let endScript = WKUserScript(source: endJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
@@ -450,11 +433,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
             isPlaying = true
-            // Segera pulihkan sesi native setelah WebKit mulai bersuara agar Next/Prev & Artwork tidak abu-abu
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.maintainNativeSession()
-            }
+            updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
             isPlaying = false
             updateAnchorState()
@@ -468,27 +449,22 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func setupLifecycleObservers() {
-        // Pulihkan sesi audio native dan HTML5 video secara otomatis setiap kali terjadi interupsi audio di iOS 12
-        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
-            guard let self = self, self.isPlaying else { return }
-            if let info = notification.userInfo,
-               let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-               let type = AVAudioSession.InterruptionType(rawValue: typeValue),
-               type == .ended {
-                self.maintainNativeSession()
-                self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
-            }
-        }
-
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.beginBackgroundTaskIfNeeded()
-            self.maintainNativeSession()
+            if self.silentPlayer?.isPlaying == false {
+                self.silentPlayer?.play()
+            }
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            self.maintainNativeSession()
+            if self.silentPlayer?.isPlaying == false {
+                self.silentPlayer?.play()
+            }
+            if let song = self.currentSong {
+                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
+            }
             let resumeJS = """
             (function() {
                 window.__userPaused = false;
