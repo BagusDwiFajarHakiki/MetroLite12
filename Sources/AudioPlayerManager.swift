@@ -20,7 +20,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var lastUserPauseTimestamp: Date?
     private var isTransitioningTrack = false
-    private var loadFallbackWorkItem: DispatchWorkItem?
     
     var onStateChanged: ((Bool, String, UIImage?) -> Void)?
     var onQueueUpdated: (([SongItem]) -> Void)?
@@ -82,18 +81,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func startNativeAutoNextWatchdog() {
         nativeAutoNextTimer?.invalidate()
         nativeAutoNextTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.isPlaying, !self.isTransitioningTrack else { return }
+            guard let self = self, self.isPlaying else { return }
             if self.silentPlayer?.isPlaying == false {
                 self.silentPlayer?.play()
-            }
-
-            if self.currentDuration > 10.0 {
-                self.currentPlaybackTime += 1.0
-                if self.currentPlaybackTime >= (self.currentDuration + 0.5) {
-                    self.isTransitioningTrack = true
-                    self.playNext()
-                    return
-                }
             }
 
             let probeJS = """
@@ -180,10 +170,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
         let endJS = """
         (function() {
-            window.__reportedPlayingForSrc = "";
+            window.__reportedPlayingForSig = "";
             window.__endedTriggered = false;
             window.__savedTime = 0;
             window.__mainDuration = 0;
+            window.__targetVideoId = "";
 
             function triggerSongEnded() {
                 if (window.__endedTriggered) return;
@@ -245,9 +236,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         currentTime: video.currentTime || 0,
                         duration: isFinite(video.duration) ? video.duration : 0
                     });
-                    var sig = video.src + "_" + Math.floor(video.duration || 0);
-                    if (window.__reportedPlayingForSrc !== sig) {
-                        window.__reportedPlayingForSrc = sig;
+                    var sig = window.__targetVideoId + "_" + video.src + "_" + Math.floor(video.duration || 0);
+                    if (window.__reportedPlayingForSig !== sig) {
+                        window.__reportedPlayingForSig = sig;
                         window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
                     }
                 }
@@ -402,7 +393,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentArtworkImage = nil
         currentPlaybackTime = 0
         currentDuration = 0
-        loadFallbackWorkItem?.cancel()
         
         beginBackgroundTaskIfNeeded()
         if silentPlayer?.isPlaying == false {
@@ -411,9 +401,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         startNativeAutoNextWatchdog()
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
-        
-        let resetJS = "window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__endedTriggered = false; window.__savedTime = 0; window.__mainDuration = 0;"
-        webView.evaluateJavaScript(resetJS, completionHandler: nil)
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
             guard let self = self, self.currentSong?.videoId == song.videoId else { return }
@@ -424,35 +411,34 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             self.onStateChanged?(self.isPlaying, statusText, squareArt)
         }
 
-        // Selalu gunakan navigasi SPA (a.click) baik saat layar menyala maupun terkunci agar elemen <video> yang sudah ter-unlock tetap dipakai
+        // Gunakan API internal YouTube player.loadVideoById() agar video baru langsung diputar dalam elemen <video> yang sama tanpa reload halaman saat layar terkunci
         if isPlayerPageLoaded {
-            let spaNavigateJS = """
+            let loadByIdJS = """
             (function() {
                 window.__userPaused = false;
-                window.__reportedPlayingForSrc = '';
+                window.__reportedPlayingForSig = '';
                 window.__endedTriggered = false;
                 window.__savedTime = 0;
                 window.__mainDuration = 0;
-                var a = document.createElement('a');
-                a.href = '/watch?v=\(song.videoId)';
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
+                window.__targetVideoId = '\(song.videoId)';
+
+                var player = document.getElementById('movie_player');
+                if (player && typeof player.loadVideoById === 'function') {
+                    player.loadVideoById('\(song.videoId)');
+                    if (typeof player.playVideo === 'function') player.playVideo();
+                    var v = document.querySelector('video');
+                    if (v) { v.muted = false; v.volume = 1.0; v.play().catch(function(e){}); }
+                    return 'loaded_by_id';
+                }
+                return 'fallback_needed';
             })();
             """
-            webView.evaluateJavaScript(spaNavigateJS) { [weak self] _, error in
-                if error != nil {
-                    self?.loadWatchURL(videoId: song.videoId)
+            webView.evaluateJavaScript(loadByIdJS) { [weak self] result, _ in
+                if let res = result as? String, res == "loaded_by_id" {
+                    return
                 }
+                self?.loadWatchURL(videoId: song.videoId)
             }
-
-            // Cadangan jika setelah 6 detik video baru belum mulai bersuara
-            let fallback = DispatchWorkItem { [weak self] in
-                guard let self = self, self.currentSong?.videoId == song.videoId, self.isTransitioningTrack else { return }
-                self.loadWatchURL(videoId: song.videoId)
-            }
-            loadFallbackWorkItem = fallback
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: fallback)
         } else {
             loadWatchURL(videoId: song.videoId)
         }
@@ -478,6 +464,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func loadWatchURL(videoId: String) {
+        let resetJS = "window.__userPaused = false; window.__reportedPlayingForSig = ''; window.__endedTriggered = false; window.__savedTime = 0; window.__mainDuration = 0; window.__targetVideoId = '\(videoId)';"
+        webView.evaluateJavaScript(resetJS, completionHandler: nil)
         if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(videoId)") {
             var request = URLRequest(url: watchURL)
             request.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
@@ -487,8 +475,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isPlayerPageLoaded = true
-        if isPlaying {
-            let forcePlayJS = "window.__userPaused = false; var v = document.querySelector('video'); if(v) { v.muted = false; v.volume = 1.0; v.play().catch(function(e){}); }"
+        if isPlaying, let vid = currentSong?.videoId {
+            let forcePlayJS = "window.__userPaused = false; window.__targetVideoId = '\(vid)'; var v = document.querySelector('video'); if(v) { v.muted = false; v.volume = 1.0; v.play().catch(function(e){}); }"
             webView.evaluateJavaScript(forcePlayJS, completionHandler: nil)
         }
     }
@@ -555,7 +543,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
             isTransitioningTrack = false
-            loadFallbackWorkItem?.cancel()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "ended":
