@@ -7,6 +7,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     static let shared = AudioPlayerManager()
     
     private var webView: WKWebView!
+    private var silentPlayer: AVAudioPlayer?
+    private var nowPlayingTimer: Timer?
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
     private var isPlayerPageLoaded = false
@@ -18,6 +20,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private override init() {
         super.init()
         setupAudioSession()
+        setupSilentAnchorPlayer()
         setupWebView()
         setupRemoteCommands()
         setupLifecycleObservers()
@@ -28,8 +31,62 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [])
             try session.setActive(true)
+            UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
             print("AudioSession error: \(error)")
+        }
+    }
+
+    // Menghasilkan WAV senyap 1 detik di memori untuk menjaga sesi audio native tetap terkunci di iOS 12
+    private func setupSilentAnchorPlayer() {
+        let sampleRate: Int32 = 8000
+        let numSamples: Int32 = 8000
+        let dataSize = numSamples * 2
+        let fileSize = 36 + dataSize
+
+        var header = Data()
+        header.append("RIFF".data(using: .ascii)!)
+        header.append(withUnsafeBytes(of: fileSize.littleEndian) { Data($0) })
+        header.append("WAVEfmt ".data(using: .ascii)!)
+        header.append(withUnsafeBytes(of: Int32(16).littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) }) // PCM
+        header.append(withUnsafeBytes(of: Int16(1).littleEndian) { Data($0) }) // Mono
+        header.append(withUnsafeBytes(of: sampleRate.littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: (sampleRate * 2).littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: Int16(2).littleEndian) { Data($0) })
+        header.append(withUnsafeBytes(of: Int16(16).littleEndian) { Data($0) })
+        header.append("data".data(using: .ascii)!)
+        header.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
+        header.append(Data(count: Int(dataSize)))
+
+        if let player = try? AVAudioPlayer(data: header) {
+            player.numberOfLoops = -1
+            player.volume = 0.01
+            player.prepareToPlay()
+            silentPlayer = player
+        }
+    }
+
+    private func updateAnchorState() {
+        if isPlaying {
+            try? AVAudioSession.sharedInstance().setActive(true)
+            if silentPlayer?.isPlaying == false {
+                silentPlayer?.play()
+            }
+            startNowPlayingKeepAlive()
+        } else {
+            silentPlayer?.pause()
+            nowPlayingTimer?.invalidate()
+            nowPlayingTimer = nil
+        }
+    }
+
+    // Mempertahankan metadata lagu di Lock Screen & Control Center agar tidak tertimpa WebKit
+    private func startNowPlayingKeepAlive() {
+        nowPlayingTimer?.invalidate()
+        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            guard let self = self, self.isPlaying, let song = self.currentSong else { return }
+            self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
         }
     }
 
@@ -43,7 +100,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let contentController = WKUserContentController()
         contentController.add(self, name: "nativeBridge")
 
-        // 1. Kunci kualitas video ke 144p ('tiny') untuk hemat kuota & palsukan Visibility API agar jalan di background
         let startJS = """
         (function() {
             try {
@@ -70,7 +126,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let startScript = WKUserScript(source: startJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(startScript)
 
-        // 2. Paksa resolusi terendah pada player internal YouTube & sinkronkan status audio berjalan
         let endJS = """
         (function() {
             window.__userPaused = false;
@@ -104,9 +159,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     video.__hooked = true;
                     video.addEventListener('pause', function() {
                         if (!window.__userPaused && !video.ended) {
-                            setTimeout(function() {
-                                if (!window.__userPaused) video.play().catch(function(e) {});
-                            }, 50);
+                            video.play().catch(function(e) {});
                         } else if (window.__userPaused) {
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
                         }
@@ -152,11 +205,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentSong = song
         isPlaying = true
         currentArtworkImage = nil
+        updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = '';", completionHandler: nil)
 
-        // Unduh thumbnail untuk mini-player dan Lock Screen
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
             guard let self = self, self.currentSong?.videoId == song.videoId else { return }
             self.currentArtworkImage = image
@@ -212,6 +265,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
         }
+        updateAnchorState()
         updateNowPlayingInfo(song: song, image: currentArtworkImage)
         onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
     }
@@ -224,14 +278,19 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         switch status {
         case "playing":
             isPlaying = true
+            updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
             isPlaying = false
+            updateAnchorState()
             onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "ended":
             isPlaying = false
+            updateAnchorState()
             onStateChanged?(false, "Selesai: \(song.title)", currentArtworkImage)
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
         default:
             break
         }
@@ -241,12 +300,14 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             try? AVAudioSession.sharedInstance().setActive(true)
+            self.silentPlayer?.play()
             self.beginBackgroundTaskIfNeeded()
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
+            self.silentPlayer?.play()
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
@@ -283,11 +344,20 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func setupRemoteCommands() {
         let commandCenter = MPRemoteCommandCenter.shared()
+        commandCenter.playCommand.isEnabled = true
         commandCenter.playCommand.addTarget { [weak self] _ in
-            self?.togglePlayPause()
+            guard let self = self else { return .commandFailed }
+            if !self.isPlaying { self.togglePlayPause() }
             return .success
         }
+        commandCenter.pauseCommand.isEnabled = true
         commandCenter.pauseCommand.addTarget { [weak self] _ in
+            guard let self = self else { return .commandFailed }
+            if self.isPlaying { self.togglePlayPause() }
+            return .success
+        }
+        commandCenter.togglePlayPauseCommand.isEnabled = true
+        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
             self?.togglePlayPause()
             return .success
         }
