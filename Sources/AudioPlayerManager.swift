@@ -36,7 +36,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
+            // .mixWithOthers mencegah benturan interupsi antara silentPlayer dan stream WebKit saat Control Center dibuka
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
@@ -75,6 +76,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func updateAnchorState() {
         if isPlaying {
+            try? AVAudioSession.sharedInstance().setActive(true)
             if silentPlayer?.isPlaying == false {
                 silentPlayer?.play()
             }
@@ -108,12 +110,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             
             var origAddEventListener = document.addEventListener;
             document.addEventListener = function(type, listener, options) {
-                if (type === 'visibilitychange' || type === 'webkitvisibilitychange' || type === 'pagehide') {
+                if (type === 'visibilitychange' || type === 'webkitvisibilitychange' || type === 'pagehide' || type === 'blur' || type === 'focusout') {
                     return;
                 }
                 return origAddEventListener.call(document, type, listener, options);
             };
             window.addEventListener('pagehide', function(e) { e.stopImmediatePropagation(); }, true);
+            window.addEventListener('blur', function(e) { e.stopImmediatePropagation(); }, true);
         })();
         """
         let startScript = WKUserScript(source: startJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
@@ -125,12 +128,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.__reportedPlayingForSrc = "";
             window.__reportedEndedForSrc = "";
             window.__qualitySetForSrc = "";
+            window.__savedTime = 0;
+            window.__activeVideoId = "";
             
             setInterval(function() {
                 var video = document.querySelector('video');
                 if (!video) return;
 
-                // Atur kualitas 144p HANYA sekali saat sumber video baru dimuat agar tidak memutus audio di detik awal
                 if (video.src && window.__qualitySetForSrc !== video.src) {
                     var player = document.getElementById('movie_player');
                     if (player && player.setPlaybackQualityRange) {
@@ -141,7 +145,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     }
                 }
 
-                // Lewati segmen iklan pre-roll dalam keadaan bisu jika muncul
                 var isAd = document.querySelector('.ad-showing, .ad-interrupting') !== null;
                 if (isAd) {
                     video.muted = true;
@@ -156,11 +159,24 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 if (!window.__userPaused) {
                     if (video.muted) video.muted = false;
                     if (video.volume < 1.0) video.volume = 1.0;
+
+                    // Jika layar baru dikunci dan pemutar YouTube sempat me-reset posisi ke 0, kembalikan ke detik terakhir!
+                    if (window.__savedTime > 3.0 && video.currentTime < 1.5 && video.readyState >= 2) {
+                        try {
+                            video.currentTime = window.__savedTime;
+                        } catch(e) {}
+                    }
+
                     if (video.paused && !video.ended && video.readyState >= 2) {
                         video.play().catch(function(e) {});
                     }
-                    // Tunggu buffer stabil (readyState >= 3 dan currentTime > 0.25) agar tidak terputus setelah dilaporkan playing
+
                     if (!video.paused && video.readyState >= 3 && video.currentTime > 0.25) {
+                        // Simpan detik berjalan secara terus-menerus
+                        if (video.currentTime >= window.__savedTime || (window.__savedTime - video.currentTime) < 2.0) {
+                            window.__savedTime = video.currentTime;
+                        }
+
                         window.webkit.messageHandlers.nativeBridge.postMessage({
                             status: 'progress',
                             currentTime: video.currentTime || 0,
@@ -172,7 +188,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
                         }
                     }
-                    if ((video.ended || (isFinite(video.duration) && video.duration > 5 && (video.duration - video.currentTime) <= 0.4)) && window.__reportedEndedForSrc !== video.src) {
+
+                    if ((video.ended || (isFinite(video.duration) && video.duration > 10 && (video.duration - video.currentTime) <= 0.4)) && window.__reportedEndedForSrc !== video.src) {
+                        window.__savedTime = 0;
                         window.__reportedEndedForSrc = video.src;
                         window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
                     }
@@ -182,13 +200,22 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     video.__hooked = true;
                     video.addEventListener('pause', function() {
                         if (!window.__userPaused && !video.ended) {
-                            video.play().catch(function(e) {});
+                            // Pulihkan pemutaran langsung tanpa mereset currentTime
+                            setTimeout(function() {
+                                if (!window.__userPaused && video.paused) {
+                                    if (window.__savedTime > 3.0 && video.currentTime < 1.5) {
+                                        try { video.currentTime = window.__savedTime; } catch(e) {}
+                                    }
+                                    video.play().catch(function(e) {});
+                                }
+                            }, 30);
                         } else if (window.__userPaused) {
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
                         }
                     });
                     video.addEventListener('ended', function() {
                         if (window.__reportedEndedForSrc !== video.src) {
+                            window.__savedTime = 0;
                             window.__reportedEndedForSrc = video.src;
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
                         }
@@ -313,7 +340,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
-        webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__qualitySetForSrc = '';", completionHandler: nil)
+        
+        let resetJS = "window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__qualitySetForSrc = ''; window.__savedTime = 0;"
+        webView.evaluateJavaScript(resetJS, completionHandler: nil)
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
             guard let self = self, self.currentSong?.videoId == song.videoId else { return }
@@ -330,6 +359,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 window.__reportedPlayingForSrc = '';
                 window.__reportedEndedForSrc = '';
                 window.__qualitySetForSrc = '';
+                window.__savedTime = 0;
                 var a = document.createElement('a');
                 a.href = '/watch?v=\(song.videoId)';
                 document.body.appendChild(a);
@@ -403,17 +433,34 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func setupLifecycleObservers() {
+        // Saat menarik Control Center (willResignActive), cukup pastikan audio session & silentPlayer hidup tanpa me-reset video
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.beginBackgroundTaskIfNeeded()
-            self.silentPlayer?.play()
-            self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
+            if self.silentPlayer?.isPlaying == false {
+                self.silentPlayer?.play()
+            }
         }
 
+        // Saat layar dimatikan (didEnterBackground), pulihkan pemutaran dari detik terakhir (__savedTime) tanpa mengulang dari awal
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            self.silentPlayer?.play()
-            self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
+            if self.silentPlayer?.isPlaying == false {
+                self.silentPlayer?.play()
+            }
+            let resumeJS = """
+            (function() {
+                window.__userPaused = false;
+                var v = document.querySelector('video');
+                if (v) {
+                    if (window.__savedTime > 3.0 && v.currentTime < 1.5) {
+                        try { v.currentTime = window.__savedTime; } catch(e) {}
+                    }
+                    if (v.paused) v.play().catch(function(e) {});
+                }
+            })();
+            """
+            self.webView.evaluateJavaScript(resumeJS, completionHandler: nil)
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
