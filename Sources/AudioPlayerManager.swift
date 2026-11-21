@@ -8,6 +8,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     private var webView: WKWebView!
     private var silentPlayer: AVAudioPlayer?
+    private var nowPlayingTimer: Timer?
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
     
@@ -36,8 +37,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // .mixWithOthers wajib aktif agar silentPlayer dan WKWebView berjalan bersamaan tanpa saling memutus saat layar mati
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            // Wajib tanpa .mixWithOthers agar Lock Screen iOS 12 mengaktifkan Next/Previous & Artwork
+            try session.setCategory(.playback, mode: .default, options: [])
             try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
@@ -68,21 +69,35 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
         if let player = try? AVAudioPlayer(data: header) {
             player.numberOfLoops = -1
-            player.volume = 0.01
+            player.volume = 0.02
             player.prepareToPlay()
             silentPlayer = player
         }
     }
 
+    private func maintainNativeSession() {
+        guard isPlaying else { return }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+        try? AVAudioSession.sharedInstance().setActive(true)
+        if silentPlayer?.isPlaying == false {
+            silentPlayer?.play()
+        }
+        if let song = currentSong {
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
+        }
+    }
+
     private func updateAnchorState() {
         if isPlaying {
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try? AVAudioSession.sharedInstance().setActive(true)
-            if silentPlayer?.isPlaying == false {
-                silentPlayer?.play()
+            maintainNativeSession()
+            nowPlayingTimer?.invalidate()
+            nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                self?.maintainNativeSession()
             }
         } else {
             silentPlayer?.pause()
+            nowPlayingTimer?.invalidate()
+            nowPlayingTimer = nil
         }
     }
 
@@ -130,48 +145,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.__reportedEndedForSrc = "";
             window.__qualitySetForSrc = "";
             window.__savedTime = 0;
-            window.__songMeta = { title: "MetroLite 12", artist: "YouTube Music", artwork: "" };
-            window.__mediaHandlersBound = false;
-
-            window.__applyWebMediaSession = function() {
-                if (!('mediaSession' in navigator)) return;
-                try {
-                    navigator.mediaSession.metadata = new MediaMetadata({
-                        title: window.__songMeta.title,
-                        artist: window.__songMeta.artist,
-                        album: 'MetroLite 12',
-                        artwork: window.__songMeta.artwork ? [
-                            { src: window.__songMeta.artwork, sizes: '96x96', type: 'image/jpeg' },
-                            { src: window.__songMeta.artwork, sizes: '128x128', type: 'image/jpeg' },
-                            { src: window.__songMeta.artwork, sizes: '256x256', type: 'image/jpeg' },
-                            { src: window.__songMeta.artwork, sizes: '512x512', type: 'image/jpeg' }
-                        ] : []
-                    });
-                    navigator.mediaSession.playbackState = window.__userPaused ? 'paused' : 'playing';
-
-                    if (!window.__mediaHandlersBound) {
-                        window.__mediaHandlersBound = true;
-                        navigator.mediaSession.setActionHandler('play', function() {
-                            window.__userPaused = false;
-                            var v = document.querySelector('video');
-                            if (v) v.play();
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePlay' });
-                        });
-                        navigator.mediaSession.setActionHandler('pause', function() {
-                            window.__userPaused = true;
-                            var v = document.querySelector('video');
-                            if (v) v.pause();
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePause' });
-                        });
-                        navigator.mediaSession.setActionHandler('nexttrack', function() {
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remoteNext' });
-                        });
-                        navigator.mediaSession.setActionHandler('previoustrack', function() {
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePrev' });
-                        });
-                    }
-                } catch(e) {}
-            };
             
             setInterval(function() {
                 var video = document.querySelector('video');
@@ -217,7 +190,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                             window.__savedTime = video.currentTime;
                         }
 
-                        window.__applyWebMediaSession();
                         window.webkit.messageHandlers.nativeBridge.postMessage({
                             status: 'progress',
                             currentTime: video.currentTime || 0,
@@ -292,17 +264,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         webView.alpha = 1.0
         webView.isUserInteractionEnabled = false
         window.addSubview(webView)
-    }
-
-    private func syncWebMetadata(song: SongItem) {
-        let safeTitle = song.title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
-        let safeArtist = song.artist.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
-        let artURL = song.thumbnailURL?.absoluteString ?? ""
-        let js = """
-        window.__songMeta = { title: '\(safeTitle)', artist: '\(safeArtist)', artwork: '\(artURL)' };
-        if (window.__applyWebMediaSession) window.__applyWebMediaSession();
-        """
-        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     func startRadioWithSong(_ song: SongItem) {
@@ -390,7 +351,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentDuration = 0
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
-        syncWebMetadata(song: song)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         
         let resetJS = "window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__qualitySetForSrc = ''; window.__savedTime = 0;"
@@ -459,9 +419,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isPlayerPageLoaded = true
-        if let song = currentSong {
-            syncWebMetadata(song: song)
-        }
     }
 
     func togglePlayPause() {
@@ -477,7 +434,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
         }
-        syncWebMetadata(song: song)
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: currentArtworkImage)
         onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
@@ -492,39 +448,47 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         case "progress":
             if let ct = body["currentTime"] as? Double { currentPlaybackTime = ct }
             if let dur = body["duration"] as? Double { currentDuration = dur }
-        case "playing", "remotePlay":
+        case "playing":
             isPlaying = true
-            updateAnchorState()
+            // Segera pulihkan sesi native setelah WebKit mulai bersuara agar Next/Prev & Artwork tidak abu-abu
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.maintainNativeSession()
+            }
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
-            updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        case "paused", "remotePause":
+        case "paused":
             isPlaying = false
             updateAnchorState()
             onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        case "ended", "remoteNext":
+        case "ended":
             playNext()
-        case "remotePrev":
-            playPrevious()
         default:
             break
         }
     }
 
     private func setupLifecycleObservers() {
+        // Pulihkan sesi audio native dan HTML5 video secara otomatis setiap kali terjadi interupsi audio di iOS 12
+        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
+            guard let self = self, self.isPlaying else { return }
+            if let info = notification.userInfo,
+               let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+               let type = AVAudioSession.InterruptionType(rawValue: typeValue),
+               type == .ended {
+                self.maintainNativeSession()
+                self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
+            }
+        }
+
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.beginBackgroundTaskIfNeeded()
-            if self.silentPlayer?.isPlaying == false {
-                self.silentPlayer?.play()
-            }
+            self.maintainNativeSession()
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            if self.silentPlayer?.isPlaying == false {
-                self.silentPlayer?.play()
-            }
+            self.maintainNativeSession()
             let resumeJS = """
             (function() {
                 window.__userPaused = false;
