@@ -43,8 +43,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    // Menghasilkan gelombang PCM 10Hz beramplitudo sangat kecil agar SpringBoard iOS 12
-    // mendeteksi MetroLite12 sebagai pemutar audio aktif di Layar Kunci
     private func setupAnchorAudioPlayer() {
         let sampleRate: Int32 = 8000
         let numSamples: Int32 = 8000
@@ -68,26 +66,34 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         var pcmData = Data(capacity: Int(dataSize))
         for i in 0..<Int(numSamples) {
             let angle = 2.0 * Double.pi * 10.0 * Double(i) / Double(sampleRate)
-            let sample = Int16(sin(angle) * 12.0) // Amplitudo mikro (tidak terdengar, tetapi terbaca sistem)
+            let sample = Int16(sin(angle) * 18.0)
             pcmData.append(withUnsafeBytes(of: sample.littleEndian) { Data($0) })
         }
         header.append(pcmData)
 
         if let player = try? AVAudioPlayer(data: header) {
             player.numberOfLoops = -1
-            player.volume = 0.05
+            player.volume = 0.08
             player.prepareToPlay()
             silentPlayer = player
         }
     }
 
+    // Merebut kembali kepemilikan Now Playing dari proses WebKit.WebContent
+    private func reclaimNowPlayingFocus() {
+        guard isPlaying else { return }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+        try? AVAudioSession.sharedInstance().setActive(true)
+        silentPlayer?.pause()
+        silentPlayer?.play()
+        if let song = currentSong {
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
+        }
+    }
+
     private func updateAnchorState() {
         if isPlaying {
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-            try? AVAudioSession.sharedInstance().setActive(true)
-            if silentPlayer?.isPlaying == false {
-                silentPlayer?.play()
-            }
+            reclaimNowPlayingFocus()
             startNowPlayingKeepAlive()
         } else {
             silentPlayer?.pause()
@@ -98,8 +104,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func startNowPlayingKeepAlive() {
         nowPlayingTimer?.invalidate()
-        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, let song = self.currentSong else { return }
+            if self.silentPlayer?.isPlaying == false {
+                self.silentPlayer?.play()
+            }
             self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
         }
     }
@@ -260,7 +269,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentPlaybackTime = 0
         currentDuration = 0
         updateAnchorState()
-        updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = '';", completionHandler: nil)
 
@@ -336,9 +344,12 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
             isPlaying = true
+            // Rebut kembali fokus Now Playing sesaat setelah stream WebKit mulai bersuara
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.reclaimNowPlayingFocus()
+            }
             updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
-            updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
             isPlaying = false
             updateAnchorState()
@@ -354,20 +365,16 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupLifecycleObservers() {
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            try? AVAudioSession.sharedInstance().setActive(true)
-            self.silentPlayer?.play()
             self.beginBackgroundTaskIfNeeded()
-            if let song = self.currentSong {
-                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
-            }
+            self.reclaimNowPlayingFocus()
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            self.silentPlayer?.play()
-            if let song = self.currentSong {
-                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
+            // Panggil ulang reclaimFocus setelah layar benar-benar terkunci agar SpringBoard mempertahankan widget
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.reclaimNowPlayingFocus()
             }
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
