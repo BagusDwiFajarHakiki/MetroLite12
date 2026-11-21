@@ -17,6 +17,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     private var isPlayerPageLoaded = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var lastUserPauseTimestamp: Date?
     
     var onStateChanged: ((Bool, String, UIImage?) -> Void)?
     var onQueueUpdated: (([SongItem]) -> Void)?
@@ -70,7 +71,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             player.volume = 0.01
             player.prepareToPlay()
             silentPlayer = player
-            // Jalankan anchor player secara permanen sejak aplikasi dibuka agar tidak terjadi re-init audio hardware saat ganti lagu/kunci layar
             silentPlayer?.play()
         }
     }
@@ -85,10 +85,10 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let contentController = WKUserContentController()
         contentController.add(self, name: "nativeBridge")
 
-        // 1. Pencegatan tingkat prototype (.atDocumentStart) agar WebKit/YouTube tidak bisa menjeda video pada 0ms saat layar dimatikan atau awal pemuatan
         let startJS = """
         (function() {
             window.__userPaused = false;
+            window.__nativePauseLockUntil = 0;
 
             try {
                 var exp = Date.now() + 2592000000;
@@ -96,13 +96,12 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 localStorage.setItem('yt-player-av1-pref', '144');
             } catch(e) {}
 
-            // Blokir panggilan .pause() otomatis dari sistem/WebKit saat layar dimatikan atau inisialisasi awal
             var origPause = HTMLMediaElement.prototype.pause;
+            window.__origMediaPause = origPause;
             HTMLMediaElement.prototype.pause = function() {
-                if (window.__userPaused || this.ended) {
+                if (window.__userPaused || this.ended || Date.now() < window.__nativePauseLockUntil) {
                     return origPause.apply(this, arguments);
                 }
-                // Abaikan perintah pause otomatis dari WebKit/YouTube saat user tidak menekan Pause
             };
 
             Object.defineProperty(document, 'hidden', { get: function() { return false; } });
@@ -124,19 +123,38 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let startScript = WKUserScript(source: startJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(startScript)
 
-        // 2. Pengawasan pemutaran mulus tanpa mengubah kualitas di tengah jalan (menghindari re-buffer 1 detik di awal)
         let endJS = """
         (function() {
             window.__reportedPlayingForSrc = "";
-            window.__reportedEndedForSrc = "";
+            window.__endedTriggered = false;
             window.__savedTime = 0;
+            window.__mainDuration = 0;
+
+            function triggerSongEnded() {
+                if (window.__endedTriggered) return;
+                window.__endedTriggered = true;
+                window.__savedTime = 0;
+                window.__mainDuration = 0;
+                window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
+            }
             
             setInterval(function() {
                 var video = document.querySelector('video');
                 if (!video) return;
 
+                if (window.__userPaused || Date.now() < window.__nativePauseLockUntil) {
+                    if (!video.paused && window.__origMediaPause) {
+                        window.__origMediaPause.call(video);
+                    }
+                    return;
+                }
+
                 var isAd = document.querySelector('.ad-showing, .ad-interrupting') !== null;
                 if (isAd) {
+                    if (window.__savedTime > 15.0) {
+                        triggerSongEnded();
+                        return;
+                    }
                     video.muted = true;
                     if (isFinite(video.duration) && video.duration > 0) {
                         video.currentTime = video.duration;
@@ -146,63 +164,65 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     return;
                 }
 
-                if (!window.__userPaused) {
-                    if (video.muted) video.muted = false;
-                    if (video.volume < 1.0) video.volume = 1.0;
+                if (video.muted) video.muted = false;
+                if (video.volume < 1.0) video.volume = 1.0;
 
-                    if (window.__savedTime > 3.0 && video.currentTime < 1.5 && video.readyState >= 2) {
-                        try {
-                            video.currentTime = window.__savedTime;
-                        } catch(e) {}
+                if (window.__savedTime > 3.0 && video.currentTime < 1.5 && video.readyState >= 2 && !window.__endedTriggered) {
+                    try {
+                        video.currentTime = window.__savedTime;
+                    } catch(e) {}
+                }
+
+                if (video.paused && !video.ended && video.readyState >= 2 && !window.__endedTriggered) {
+                    video.play().catch(function(e) {});
+                }
+
+                if (!video.paused && video.readyState >= 3 && video.currentTime > 0.35) {
+                    if (video.currentTime >= window.__savedTime || (window.__savedTime - video.currentTime) < 2.0) {
+                        window.__savedTime = video.currentTime;
+                    }
+                    if (isFinite(video.duration) && video.duration > 15) {
+                        window.__mainDuration = video.duration;
                     }
 
-                    if (video.paused && !video.ended && video.readyState >= 2) {
-                        video.play().catch(function(e) {});
+                    window.webkit.messageHandlers.nativeBridge.postMessage({
+                        status: 'progress',
+                        currentTime: video.currentTime || 0,
+                        duration: isFinite(video.duration) ? video.duration : 0
+                    });
+                    var sig = video.src + "_" + Math.floor(video.duration || 0);
+                    if (window.__reportedPlayingForSrc !== sig) {
+                        window.__reportedPlayingForSrc = sig;
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
                     }
+                }
 
-                    // Tunggu buffer benar-benar penuh (readyState === 4 / HAVE_ENOUGH_DATA) sebelum status memuat dihilangkan
-                    if (!video.paused && video.readyState >= 4 && video.currentTime > 0.35) {
-                        if (video.currentTime >= window.__savedTime || (window.__savedTime - video.currentTime) < 2.0) {
-                            window.__savedTime = video.currentTime;
-                        }
-
-                        window.webkit.messageHandlers.nativeBridge.postMessage({
-                            status: 'progress',
-                            currentTime: video.currentTime || 0,
-                            duration: isFinite(video.duration) ? video.duration : 0
-                        });
-                        var sig = video.src + "_" + Math.floor(video.duration || 0);
-                        if (window.__reportedPlayingForSrc !== sig) {
-                            window.__reportedPlayingForSrc = sig;
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
-                        }
-                    }
-
-                    if ((video.ended || (isFinite(video.duration) && video.duration > 10 && (video.duration - video.currentTime) <= 0.4)) && window.__reportedEndedForSrc !== video.src) {
-                        window.__savedTime = 0;
-                        window.__reportedEndedForSrc = video.src;
-                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
-                    }
+                var dur = window.__mainDuration > 0 ? window.__mainDuration : (isFinite(video.duration) ? video.duration : 0);
+                if (video.ended || (dur > 10 && video.currentTime >= (dur - 0.8))) {
+                    triggerSongEnded();
                 }
 
                 if (!video.__hooked) {
                     video.__hooked = true;
                     video.addEventListener('pause', function() {
-                        if (!window.__userPaused && !video.ended) {
-                            video.play().catch(function(e) {});
-                        } else if (window.__userPaused) {
+                        if (video.ended) {
+                            triggerSongEnded();
+                        } else if (window.__userPaused || Date.now() < window.__nativePauseLockUntil) {
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
+                        } else if (!window.__endedTriggered) {
+                            // Tunggu 250ms sebelum auto-resume agar perintah pause dari Control Center sempat mengunci __userPaused
+                            setTimeout(function() {
+                                if (!window.__userPaused && Date.now() >= window.__nativePauseLockUntil && !window.__endedTriggered && video.paused) {
+                                    video.play().catch(function(e) {});
+                                }
+                            }, 250);
                         }
                     });
                     video.addEventListener('ended', function() {
-                        if (window.__reportedEndedForSrc !== video.src) {
-                            window.__savedTime = 0;
-                            window.__reportedEndedForSrc = video.src;
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
-                        }
+                        triggerSongEnded();
                     });
                 }
-            }, 150);
+            }, 200);
         })();
         """
         let endScript = WKUserScript(source: endJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
@@ -262,7 +282,12 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     func playNext() {
-        guard !queue.isEmpty else { return }
+        guard !queue.isEmpty else {
+            if let current = currentSong {
+                startRadioWithSong(current)
+            }
+            return
+        }
         let nextIndex = currentIndex + 1
         if nextIndex < queue.count {
             currentIndex = nextIndex
@@ -315,6 +340,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     func play(song: SongItem) {
         currentSong = song
         isPlaying = true
+        lastUserPauseTimestamp = nil
         currentArtworkImage = nil
         currentPlaybackTime = 0
         currentDuration = 0
@@ -324,7 +350,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         
-        let resetJS = "window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__savedTime = 0;"
+        let resetJS = "window.__userPaused = false; window.__nativePauseLockUntil = 0; window.__reportedPlayingForSrc = ''; window.__endedTriggered = false; window.__savedTime = 0; window.__mainDuration = 0;"
         webView.evaluateJavaScript(resetJS, completionHandler: nil)
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
@@ -340,9 +366,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             let spaNavigateJS = """
             (function() {
                 window.__userPaused = false;
+                window.__nativePauseLockUntil = 0;
                 window.__reportedPlayingForSrc = '';
-                window.__reportedEndedForSrc = '';
+                window.__endedTriggered = false;
                 window.__savedTime = 0;
+                window.__mainDuration = 0;
                 var a = document.createElement('a');
                 a.href = '/watch?v=\(song.videoId)';
                 document.body.appendChild(a);
@@ -391,21 +419,51 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         isPlayerPageLoaded = true
     }
 
-    func togglePlayPause() {
+    func pausePlayback() {
         guard let song = currentSong else { return }
-        if isPlaying {
-            webView.evaluateJavaScript("window.__userPaused = true; var v = document.querySelector('video'); if(v) v.pause();", completionHandler: nil)
-            isPlaying = false
-        } else {
-            webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v) { v.muted = false; v.volume = 1.0; v.play(); 'ok'; } else { 'reload'; }") { [weak self] result, _ in
-                if let res = result as? String, res == "reload" {
-                    self?.loadWatchURL(videoId: song.videoId)
-                }
+        isPlaying = false
+        lastUserPauseTimestamp = Date()
+        let pauseJS = """
+        window.__userPaused = true;
+        window.__nativePauseLockUntil = Date.now() + 2000;
+        var v = document.querySelector('video');
+        if (v) {
+            if (window.__origMediaPause) { window.__origMediaPause.call(v); } else { v.pause(); }
+        }
+        """
+        webView.evaluateJavaScript(pauseJS, completionHandler: nil)
+        updateNowPlayingInfo(song: song, image: currentArtworkImage)
+        onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
+    }
+
+    func resumePlayback() {
+        guard let song = currentSong else { return }
+        isPlaying = true
+        lastUserPauseTimestamp = nil
+        if silentPlayer?.isPlaying == false {
+            silentPlayer?.play()
+        }
+        let playJS = """
+        window.__userPaused = false;
+        window.__nativePauseLockUntil = 0;
+        var v = document.querySelector('video');
+        if (v) { v.muted = false; v.volume = 1.0; v.play(); 'ok'; } else { 'reload'; }
+        """
+        webView.evaluateJavaScript(playJS) { [weak self] result, _ in
+            if let res = result as? String, res == "reload" {
+                self?.loadWatchURL(videoId: song.videoId)
             }
-            isPlaying = true
         }
         updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
+        onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
+    }
+
+    func togglePlayPause() {
+        if isPlaying {
+            pausePlayback()
+        } else {
+            resumePlayback()
+        }
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -418,6 +476,10 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let ct = body["currentTime"] as? Double { currentPlaybackTime = ct }
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
+            // Abaikan laporan playing terlambat jika user baru saja menekan Pause (< 1.5 detik lalu)
+            if let pausedAt = lastUserPauseTimestamp, Date().timeIntervalSince(pausedAt) < 1.5 {
+                return
+            }
             isPlaying = true
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
@@ -487,15 +549,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
         commandCenter.playCommand.isEnabled = true
         commandCenter.playCommand.addTarget { [weak self] _ in
-            guard let self = self else { return .commandFailed }
-            if !self.isPlaying { self.togglePlayPause() }
+            self?.resumePlayback()
             return .success
         }
 
         commandCenter.pauseCommand.isEnabled = true
         commandCenter.pauseCommand.addTarget { [weak self] _ in
-            guard let self = self else { return .commandFailed }
-            if self.isPlaying { self.togglePlayPause() }
+            self?.pausePlayback()
             return .success
         }
 

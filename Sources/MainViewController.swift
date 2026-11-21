@@ -50,9 +50,7 @@ class SongTableViewCell: UITableViewCell {
 // MARK: - Tab 1: Streaming
 class StreamingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate {
     private let searchBar = UISearchBar()
-    private let bannerContainer = UIView()
     private let statusBanner = UILabel()
-    private let exitQueueButton = UIButton(type: .system)
     private let tableView = UITableView()
     private let refreshControl = UIRefreshControl()
 
@@ -80,7 +78,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             guard let self = self else { return }
             self.songs = updatedQueue
             self.isShowingRadioQueue = true
-            self.exitQueueButton.isHidden = false
+            self.updateBackButtonVisibility()
             self.statusBanner.text = "  Antrean Radio Sejenis (\(updatedQueue.count) lagu)"
             self.tableView.reloadData()
         }
@@ -102,25 +100,12 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         searchBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchBar)
 
-        bannerContainer.backgroundColor = UIColor(white: 0.11, alpha: 1.0)
-        bannerContainer.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(bannerContainer)
-
         statusBanner.text = "  Memuat katalog..."
         statusBanner.textColor = UIColor(white: 0.70, alpha: 1.0)
         statusBanner.font = UIFont.systemFont(ofSize: 12, weight: .medium)
+        statusBanner.backgroundColor = UIColor(white: 0.11, alpha: 1.0)
         statusBanner.translatesAutoresizingMaskIntoConstraints = false
-        bannerContainer.addSubview(statusBanner)
-
-        exitQueueButton.setTitle("✕ Keluar", for: .normal)
-        exitQueueButton.titleLabel?.font = UIFont.systemFont(ofSize: 11, weight: .bold)
-        exitQueueButton.setTitleColor(.white, for: .normal)
-        exitQueueButton.backgroundColor = UIColor(red: 0.85, green: 0.25, blue: 0.25, alpha: 0.9)
-        exitQueueButton.layer.cornerRadius = 4
-        exitQueueButton.isHidden = true
-        exitQueueButton.addTarget(self, action: #selector(didTapExitQueue), for: .touchUpInside)
-        exitQueueButton.translatesAutoresizingMaskIntoConstraints = false
-        bannerContainer.addSubview(exitQueueButton)
+        view.addSubview(statusBanner)
 
         refreshControl.tintColor = .white
         refreshControl.addTarget(self, action: #selector(didPullToRefresh), for: .valueChanged)
@@ -143,33 +128,37 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             searchBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             searchBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            bannerContainer.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
-            bannerContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            bannerContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            bannerContainer.heightAnchor.constraint(equalToConstant: 28),
+            statusBanner.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
+            statusBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            statusBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            statusBanner.heightAnchor.constraint(equalToConstant: 26),
 
-            exitQueueButton.trailingAnchor.constraint(equalTo: bannerContainer.trailingAnchor, constant: -10),
-            exitQueueButton.centerYAnchor.constraint(equalTo: bannerContainer.centerYAnchor),
-            exitQueueButton.widthAnchor.constraint(equalToConstant: 64),
-            exitQueueButton.heightAnchor.constraint(equalToConstant: 20),
-
-            statusBanner.leadingAnchor.constraint(equalTo: bannerContainer.leadingAnchor, constant: 4),
-            statusBanner.trailingAnchor.constraint(equalTo: exitQueueButton.leadingAnchor, constant: -6),
-            statusBanner.centerYAnchor.constraint(equalTo: bannerContainer.centerYAnchor),
-
-            tableView.topAnchor.constraint(equalTo: bannerContainer.bottomAnchor),
+            tableView.topAnchor.constraint(equalTo: statusBanner.bottomAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: guide.bottomAnchor)
         ])
     }
 
+    private func updateBackButtonVisibility() {
+        if isShowingRadioQueue {
+            let backBtn = UIBarButtonItem(title: "<", style: .plain, target: self, action: #selector(didTapExitQueue))
+            backBtn.setTitleTextAttributes([
+                .font: UIFont.systemFont(ofSize: 22, weight: .bold),
+                .foregroundColor: UIColor.white
+            ], for: .normal)
+            navigationItem.leftBarButtonItem = backBtn
+        } else {
+            navigationItem.leftBarButtonItem = nil
+        }
+    }
+
     @objc private func didTapExitQueue() {
         isShowingRadioQueue = false
-        exitQueueButton.isHidden = true
+        updateBackButtonVisibility()
         if !browseSongs.isEmpty {
             songs = browseSongs
-            statusBanner.text = "  Katalog Lagu (\(songs.count) lagu)"
+            statusBanner.text = "  \(lastQuery) (\(songs.count) lagu)"
             tableView.reloadData()
         } else {
             performSearch(query: lastQuery, isRefresh: false)
@@ -177,7 +166,6 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
     }
 
     @objc private func didPullToRefresh() {
-        // Pilih kata kunci baru dari daftar beranda (atau segarkan pencarian aktif)
         if let typedText = searchBar.text, !typedText.trimmingCharacters(in: .whitespaces).isEmpty {
             performSearch(query: typedText, isRefresh: true)
         } else {
@@ -190,7 +178,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
     private func performSearch(query: String, isRefresh: Bool) {
         lastQuery = query
         isShowingRadioQueue = false
-        exitQueueButton.isHidden = true
+        updateBackButtonVisibility()
         if !isRefresh {
             statusBanner.text = "  Mencari: \(query)..."
         }
@@ -280,6 +268,10 @@ class RootTabBarController: UITabBarController {
     private let streamingVC = StreamingViewController()
     private let koleksiVC = KoleksiViewController()
 
+    private lazy var playIcon = makePlayIcon(size: CGSize(width: 20, height: 20))
+    private lazy var pauseIcon = makePauseIcon(size: CGSize(width: 20, height: 20))
+    private lazy var nextIcon = makeNextIcon(size: CGSize(width: 20, height: 20))
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
@@ -287,12 +279,13 @@ class RootTabBarController: UITabBarController {
         setupGlobalMiniPlayer()
 
         AudioPlayerManager.shared.onStateChanged = { [weak self] isPlaying, title, artwork in
-            self?.nowPlayingLabel.text = title
-            self?.playPauseButton.setTitle(isPlaying ? "Pause" : "Play", for: .normal)
+            guard let self = self else { return }
+            self.nowPlayingLabel.text = title
+            self.playPauseButton.setImage(isPlaying ? self.pauseIcon : self.playIcon, for: .normal)
             if let artwork = artwork {
-                self?.miniThumbView.image = artwork
+                self.miniThumbView.image = artwork
             }
-            self?.streamingVC.refreshTable()
+            self.streamingVC.refreshTable()
         }
     }
 
@@ -340,6 +333,49 @@ class RootTabBarController: UITabBarController {
         return img
     }
 
+    private func makePlayIcon(size: CGSize) -> UIImage? {
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
+        ctx.setFillColor(UIColor.white.cgColor)
+        ctx.move(to: CGPoint(x: size.width * 0.25, y: size.height * 0.18))
+        ctx.addLine(to: CGPoint(x: size.width * 0.82, y: size.height * 0.50))
+        ctx.addLine(to: CGPoint(x: size.width * 0.25, y: size.height * 0.82))
+        ctx.closePath()
+        ctx.fillPath()
+        let img = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
+        UIGraphicsEndImageContext()
+        return img
+    }
+
+    private func makePauseIcon(size: CGSize) -> UIImage? {
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
+        ctx.setFillColor(UIColor.white.cgColor)
+        let barW = size.width * 0.20
+        let barH = size.height * 0.64
+        let y = size.height * 0.18
+        ctx.fill(CGRect(x: size.width * 0.24, y: y, width: barW, height: barH))
+        ctx.fill(CGRect(x: size.width * 0.56, y: y, width: barW, height: barH))
+        let img = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
+        UIGraphicsEndImageContext()
+        return img
+    }
+
+    private func makeNextIcon(size: CGSize) -> UIImage? {
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
+        ctx.setFillColor(UIColor.white.cgColor)
+        ctx.move(to: CGPoint(x: size.width * 0.18, y: size.height * 0.20))
+        ctx.addLine(to: CGPoint(x: size.width * 0.68, y: size.height * 0.50))
+        ctx.addLine(to: CGPoint(x: size.width * 0.18, y: size.height * 0.80))
+        ctx.closePath()
+        ctx.fillPath()
+        ctx.fill(CGRect(x: size.width * 0.72, y: size.height * 0.20, width: size.width * 0.12, height: size.height * 0.60))
+        let img = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
+        UIGraphicsEndImageContext()
+        return img
+    }
+
     private func setupGlobalMiniPlayer() {
         playerBar.backgroundColor = UIColor(white: 0.15, alpha: 1.0)
         playerBar.translatesAutoresizingMaskIntoConstraints = false
@@ -362,15 +398,13 @@ class RootTabBarController: UITabBarController {
         nowPlayingLabel.translatesAutoresizingMaskIntoConstraints = false
         playerBar.addSubview(nowPlayingLabel)
 
-        playPauseButton.setTitle("Play", for: .normal)
-        playPauseButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .bold)
+        playPauseButton.setImage(playIcon, for: .normal)
         playPauseButton.tintColor = .white
         playPauseButton.addTarget(self, action: #selector(didTapPlayPause), for: .touchUpInside)
         playPauseButton.translatesAutoresizingMaskIntoConstraints = false
         playerBar.addSubview(playPauseButton)
 
-        nextButton.setTitle("Next", for: .normal)
-        nextButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .bold)
+        nextButton.setImage(nextIcon, for: .normal)
         nextButton.tintColor = .white
         nextButton.addTarget(self, action: #selector(didTapNext), for: .touchUpInside)
         nextButton.translatesAutoresizingMaskIntoConstraints = false
@@ -394,15 +428,17 @@ class RootTabBarController: UITabBarController {
 
             nextButton.trailingAnchor.constraint(equalTo: playerBar.trailingAnchor, constant: -10),
             nextButton.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
-            nextButton.widthAnchor.constraint(equalToConstant: 46),
+            nextButton.widthAnchor.constraint(equalToConstant: 36),
+            nextButton.heightAnchor.constraint(equalToConstant: 36),
 
-            playPauseButton.trailingAnchor.constraint(equalTo: nextButton.leadingAnchor, constant: -4),
+            playPauseButton.trailingAnchor.constraint(equalTo: nextButton.leadingAnchor, constant: -6),
             playPauseButton.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
-            playPauseButton.widthAnchor.constraint(equalToConstant: 52),
+            playPauseButton.widthAnchor.constraint(equalToConstant: 36),
+            playPauseButton.heightAnchor.constraint(equalToConstant: 36),
 
             nowPlayingLabel.leadingAnchor.constraint(equalTo: miniThumbView.trailingAnchor, constant: 10),
             nowPlayingLabel.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
-            nowPlayingLabel.trailingAnchor.constraint(equalTo: playPauseButton.leadingAnchor, constant: -6)
+            nowPlayingLabel.trailingAnchor.constraint(equalTo: playPauseButton.leadingAnchor, constant: -8)
         ])
     }
 
