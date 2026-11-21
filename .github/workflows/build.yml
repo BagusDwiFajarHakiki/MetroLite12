@@ -12,6 +12,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Generate 4-inch Launch Image (640x1136)
+        run: |
+          mkdir -p Resources
+          python3 -c "
+          import zlib, struct
+          w, h = 640, 1136
+          raw = b''.join(b'\x00' + b'\x14\x14\x14' * w for _ in range(h))
+          def chunk(tag, data):
+              return struct.pack('!I', len(data)) + tag + data + struct.pack('!I', zlib.crc32(tag + data) & 0xffffffff)
+          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
+          open('Resources/Default-568h@2x.png', 'wb').write(png)
+          "
+
       - name: Install XcodeGen & Generate Project
         run: |
           brew install xcodegen

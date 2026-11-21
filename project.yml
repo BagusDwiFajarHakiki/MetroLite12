@@ -1,4 +1,4 @@
-name: MetroLite
+name: MetroLite12
 options:
   bundleIdPrefix: com.local.metrolite
   deploymentTarget:
@@ -12,6 +12,7 @@ targets:
       - path: Sources
         excludes:
           - Info.plist
+      - path: Resources
     info:
       path: Sources/Info.plist
     dependencies:
