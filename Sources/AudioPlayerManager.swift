@@ -20,6 +20,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var lastUserPauseTimestamp: Date?
     private var isTransitioningTrack = false
+    private var loadFallbackWorkItem: DispatchWorkItem?
     
     var onStateChanged: ((Bool, String, UIImage?) -> Void)?
     var onQueueUpdated: (([SongItem]) -> Void)?
@@ -78,7 +79,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    // Watchdog native Swift: menjaga pemutaran di background & memicu auto-next saat durasi habis
     private func startNativeAutoNextWatchdog() {
         nativeAutoNextTimer?.invalidate()
         nativeAutoNextTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -87,7 +87,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 self.silentPlayer?.play()
             }
 
-            // Jika durasi lagu sudah diketahui dan waktu berjalan mencapai akhir, langsung lanjut lagu berikutnya
             if self.currentDuration > 10.0 {
                 self.currentPlaybackTime += 1.0
                 if self.currentPlaybackTime >= (self.currentDuration + 0.5) {
@@ -97,7 +96,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 }
             }
 
-            // Sinkronisasi langsung dengan elemen <video> di WebView
             let probeJS = """
             (function() {
                 var v = document.querySelector('video');
@@ -143,7 +141,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let contentController = WKUserContentController()
         contentController.add(self, name: "nativeBridge")
 
-        // 1. Blokir HTMLMediaElement.prototype.pause kecuali jika Swift secara eksplisit mengaktifkan window.__userPaused
         let startJS = """
         (function() {
             window.__userPaused = false;
@@ -160,7 +157,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 if (window.__userPaused || this.ended) {
                     return origPause.apply(this, arguments);
                 }
-                // Tolak semua panggilan pause() otomatis dari WebKit/YouTube saat layar dikunci
             };
 
             Object.defineProperty(document, 'hidden', { get: function() { return false; } });
@@ -182,7 +178,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let startScript = WKUserScript(source: startJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(startScript)
 
-        // 2. Pengawasan video: Jangan pernah set window.__userPaused = true dari event pause browser!
         let endJS = """
         (function() {
             window.__reportedPlayingForSrc = "";
@@ -268,7 +263,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         if (video.ended) {
                             triggerSongEnded();
                         } else if (!window.__userPaused && !window.__endedTriggered) {
-                            // Layar dimatikan atau interupsi sistem: langsung lanjutkan pemutaran!
                             video.play().catch(function(e) {});
                         }
                     });
@@ -408,6 +402,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentArtworkImage = nil
         currentPlaybackTime = 0
         currentDuration = 0
+        loadFallbackWorkItem?.cancel()
         
         beginBackgroundTaskIfNeeded()
         if silentPlayer?.isPlaying == false {
@@ -429,9 +424,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             self.onStateChanged?(self.isPlaying, statusText, squareArt)
         }
 
-        // Saat layar mati (background), muat URL watch langsung; saat aktif di layar, gunakan SPA navigation
-        let isInBackground = UIApplication.shared.applicationState != .active
-        if isPlayerPageLoaded && !isInBackground {
+        // Selalu gunakan navigasi SPA (a.click) baik saat layar menyala maupun terkunci agar elemen <video> yang sudah ter-unlock tetap dipakai
+        if isPlayerPageLoaded {
             let spaNavigateJS = """
             (function() {
                 window.__userPaused = false;
@@ -451,6 +445,14 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     self?.loadWatchURL(videoId: song.videoId)
                 }
             }
+
+            // Cadangan jika setelah 6 detik video baru belum mulai bersuara
+            let fallback = DispatchWorkItem { [weak self] in
+                guard let self = self, self.currentSong?.videoId == song.videoId, self.isTransitioningTrack else { return }
+                self.loadWatchURL(videoId: song.videoId)
+            }
+            loadFallbackWorkItem = fallback
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: fallback)
         } else {
             loadWatchURL(videoId: song.videoId)
         }
@@ -553,6 +555,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
             isTransitioningTrack = false
+            loadFallbackWorkItem?.cancel()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "ended":
