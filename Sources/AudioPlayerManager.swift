@@ -12,7 +12,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
     
-    // Antrean (Queue) lagu untuk fitur Next, Previous, dan Auto-Play
     private(set) var queue: [SongItem] = []
     private(set) var currentIndex: Int = -1
     
@@ -27,7 +26,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private override init() {
         super.init()
         setupAudioSession()
-        setupSilentAnchorPlayer()
+        setupAnchorAudioPlayer()
         setupWebView()
         setupRemoteCommands()
         setupLifecycleObservers()
@@ -37,14 +36,16 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true)
+            try session.setActive(true, options: [])
             UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
             print("AudioSession error: \(error)")
         }
     }
 
-    private func setupSilentAnchorPlayer() {
+    // Menghasilkan gelombang PCM 10Hz beramplitudo sangat kecil agar SpringBoard iOS 12
+    // mendeteksi MetroLite12 sebagai pemutar audio aktif di Layar Kunci
+    private func setupAnchorAudioPlayer() {
         let sampleRate: Int32 = 8000
         let numSamples: Int32 = 8000
         let dataSize = numSamples * 2
@@ -63,11 +64,18 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         header.append(withUnsafeBytes(of: Int16(16).littleEndian) { Data($0) })
         header.append("data".data(using: .ascii)!)
         header.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-        header.append(Data(count: Int(dataSize)))
+
+        var pcmData = Data(capacity: Int(dataSize))
+        for i in 0..<Int(numSamples) {
+            let angle = 2.0 * Double.pi * 10.0 * Double(i) / Double(sampleRate)
+            let sample = Int16(sin(angle) * 12.0) // Amplitudo mikro (tidak terdengar, tetapi terbaca sistem)
+            pcmData.append(withUnsafeBytes(of: sample.littleEndian) { Data($0) })
+        }
+        header.append(pcmData)
 
         if let player = try? AVAudioPlayer(data: header) {
             player.numberOfLoops = -1
-            player.volume = 0.01
+            player.volume = 0.05
             player.prepareToPlay()
             silentPlayer = player
         }
@@ -75,6 +83,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func updateAnchorState() {
         if isPlaying {
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
             try? AVAudioSession.sharedInstance().setActive(true)
             if silentPlayer?.isPlaying == false {
                 silentPlayer?.play()
@@ -89,7 +98,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func startNowPlayingKeepAlive() {
         nowPlayingTimer?.invalidate()
-        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isPlaying, let song = self.currentSong else { return }
             self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
         }
@@ -136,39 +145,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.__userPaused = false;
             window.__reportedPlayingForSrc = "";
             window.__reportedEndedForSrc = "";
-            window.__songMeta = { title: "MetroLite 12", artist: "YouTube Music", artwork: "" };
-
-            window.__applyWebMediaSession = function() {
-                if ('mediaSession' in navigator) {
-                    try {
-                        navigator.mediaSession.metadata = new MediaMetadata({
-                            title: window.__songMeta.title,
-                            artist: window.__songMeta.artist,
-                            album: 'MetroLite 12',
-                            artwork: window.__songMeta.artwork ? [{ src: window.__songMeta.artwork, sizes: '320x180', type: 'image/jpeg' }] : []
-                        });
-                        navigator.mediaSession.playbackState = window.__userPaused ? 'paused' : 'playing';
-                        navigator.mediaSession.setActionHandler('play', function() {
-                            window.__userPaused = false;
-                            var v = document.querySelector('video');
-                            if (v) v.play();
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePlay' });
-                        });
-                        navigator.mediaSession.setActionHandler('pause', function() {
-                            window.__userPaused = true;
-                            var v = document.querySelector('video');
-                            if (v) v.pause();
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePause' });
-                        });
-                        navigator.mediaSession.setActionHandler('nexttrack', function() {
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remoteNext' });
-                        });
-                        navigator.mediaSession.setActionHandler('previoustrack', function() {
-                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePrev' });
-                        });
-                    } catch(e) {}
-                }
-            };
             
             setInterval(function() {
                 var player = document.getElementById('movie_player');
@@ -186,7 +162,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         video.play().catch(function(e) {});
                     }
                     if (!video.paused && video.readyState >= 3 && video.currentTime > 0.05) {
-                        window.__applyWebMediaSession();
                         window.webkit.messageHandlers.nativeBridge.postMessage({
                             status: 'progress',
                             currentTime: video.currentTime || 0,
@@ -198,7 +173,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
                         }
                     }
-                    // Deteksi akhir lagu secara akurat (baik lewat event ended maupun sisa durasi < 0.4 detik)
                     if ((video.ended || (isFinite(video.duration) && video.duration > 5 && (video.duration - video.currentTime) <= 0.4)) && window.__reportedEndedForSrc !== video.src) {
                         window.__reportedEndedForSrc = video.src;
                         window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
@@ -254,18 +228,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         window.addSubview(webView)
     }
 
-    private func syncWebMetadata(song: SongItem) {
-        let safeTitle = song.title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
-        let safeArtist = song.artist.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
-        let artURL = song.thumbnailURL?.absoluteString ?? ""
-        let js = """
-        window.__songMeta = { title: '\(safeTitle)', artist: '\(safeArtist)', artwork: '\(artURL)' };
-        if (window.__applyWebMediaSession) window.__applyWebMediaSession();
-        """
-        webView.evaluateJavaScript(js, completionHandler: nil)
-    }
-
-    // Memutar lagu sekaligus menyimpan daftar antrean aktif
     func playFromQueue(songs: [SongItem], at index: Int) {
         guard songs.indices.contains(index) else { return }
         self.queue = songs
@@ -282,7 +244,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func playPrevious() {
         guard !queue.isEmpty else { return }
-        // Jika lagu sudah berjalan lebih dari 4 detik, tombol Previous mengulang dari awal lagu
         if currentPlaybackTime > 4.0, let song = currentSong {
             play(song: song)
             return
@@ -300,7 +261,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentDuration = 0
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
-        syncWebMetadata(song: song)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = '';", completionHandler: nil)
 
@@ -345,9 +305,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isPlayerPageLoaded = true
-        if let song = currentSong {
-            syncWebMetadata(song: song)
-        }
     }
 
     func togglePlayPause() {
@@ -363,7 +320,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
         }
-        syncWebMetadata(song: song)
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: currentArtworkImage)
         onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
@@ -378,23 +334,18 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         case "progress":
             if let ct = body["currentTime"] as? Double { currentPlaybackTime = ct }
             if let dur = body["duration"] as? Double { currentDuration = dur }
-        case "playing", "remotePlay":
+        case "playing":
             isPlaying = true
             updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        case "paused", "remotePause":
+        case "paused":
             isPlaying = false
             updateAnchorState()
             onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "ended":
-            // Otomatis lanjut ke lagu berikutnya saat lagu selesai diputar
             playNext()
-        case "remoteNext":
-            playNext()
-        case "remotePrev":
-            playPrevious()
         default:
             break
         }
@@ -407,7 +358,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             self.silentPlayer?.play()
             self.beginBackgroundTaskIfNeeded()
             if let song = self.currentSong {
-                self.syncWebMetadata(song: song)
                 self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
             }
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
@@ -417,7 +367,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             guard let self = self, self.isPlaying else { return }
             self.silentPlayer?.play()
             if let song = self.currentSong {
-                self.syncWebMetadata(song: song)
                 self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
             }
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
@@ -443,17 +392,20 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func updateNowPlayingInfo(song: SongItem, image: UIImage?) {
-        var info = [String: Any]()
-        info[MPMediaItemPropertyTitle] = song.title
-        info[MPMediaItemPropertyArtist] = song.artist
-        info[MPMediaItemPropertyPlaybackDuration] = currentDuration > 0 ? currentDuration : 180.0
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentPlaybackTime
-        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-        if let image = image {
-            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
-            info[MPMediaItemPropertyArtwork] = artwork
+        DispatchQueue.main.async {
+            var info = [String: Any]()
+            info[MPMediaItemPropertyTitle] = song.title
+            info[MPMediaItemPropertyArtist] = song.artist
+            info[MPMediaItemPropertyAlbumTitle] = "MetroLite 12"
+            info[MPMediaItemPropertyPlaybackDuration] = self.currentDuration > 0 ? self.currentDuration : 180.0
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.currentPlaybackTime
+            info[MPNowPlayingInfoPropertyPlaybackRate] = self.isPlaying ? 1.0 : 0.0
+            if let image = image {
+                let artwork = MPMediaItemArtwork(boundsSize: CGSize(width: 300, height: 300)) { _ in return image }
+                info[MPMediaItemPropertyArtwork] = artwork
+            }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     private func setupRemoteCommands() {
