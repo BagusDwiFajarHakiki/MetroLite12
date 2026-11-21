@@ -63,6 +63,9 @@ class SongTableViewCell: UITableViewCell {
     private var titleTrailingToDownload: NSLayoutConstraint!
     private var titleTrailingToEdge: NSLayoutConstraint!
 
+    private static let idleDownloadIcon = SongTableViewCell.makeDownloadIcon(size: CGSize(width: 22, height: 22))
+    private static let completedCheckCircleIcon = SongTableViewCell.makeDownloadedCheckIcon(size: CGSize(width: 22, height: 22))
+
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
         backgroundColor = .clear
@@ -85,7 +88,7 @@ class SongTableViewCell: UITableViewCell {
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(subtitleLabel)
 
-        downloadButton.setImage(SongTableViewCell.makeDownloadIcon(size: CGSize(width: 20, height: 20)), for: .normal)
+        downloadButton.setImage(SongTableViewCell.idleDownloadIcon, for: .normal)
         downloadButton.tintColor = .lightGray
         downloadButton.addTarget(self, action: #selector(didTapDownload), for: .touchUpInside)
         downloadButton.translatesAutoresizingMaskIntoConstraints = false
@@ -119,11 +122,18 @@ class SongTableViewCell: UITableViewCell {
         downloadButton.isHidden = !show
         titleTrailingToDownload.isActive = show
         titleTrailingToEdge.isActive = !show
+
         if isDownloading {
-            downloadButton.tintColor = UIColor(red: 1.0, green: 0.75, blue: 0.2, alpha: 1.0)
+            // Sedang mengunduh: ikon download berwarna oranye
+            downloadButton.setImage(SongTableViewCell.idleDownloadIcon, for: .normal)
+            downloadButton.tintColor = UIColor.orange
         } else if isDownloaded {
+            // Berhasil terunduh: ikon centang di dalam lingkaran berwarna hijau
+            downloadButton.setImage(SongTableViewCell.completedCheckCircleIcon, for: .normal)
             downloadButton.tintColor = UIColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1.0)
         } else {
+            // Belum diunduh: ikon download abu-abu
+            downloadButton.setImage(SongTableViewCell.idleDownloadIcon, for: .normal)
             downloadButton.tintColor = .lightGray
         }
     }
@@ -132,6 +142,7 @@ class SongTableViewCell: UITableViewCell {
         onDownloadTapped?()
     }
 
+    // Ikon vektor panah ke bawah (belum / sedang mengunduh)
     private static func makeDownloadIcon(size: CGSize) -> UIImage? {
         UIGraphicsBeginImageContextWithOptions(size, false, 0)
         guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
@@ -148,6 +159,30 @@ class SongTableViewCell: UITableViewCell {
 
         ctx.move(to: CGPoint(x: size.width * 0.22, y: size.height * 0.82))
         ctx.addLine(to: CGPoint(x: size.width * 0.78, y: size.height * 0.82))
+        ctx.strokePath()
+
+        let img = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
+        UIGraphicsEndImageContext()
+        return img
+    }
+
+    // Ikon vektor centang di dalam lingkaran (berhasil terunduh)
+    private static func makeDownloadedCheckIcon(size: CGSize) -> UIImage? {
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
+        ctx.setStrokeColor(UIColor.white.cgColor)
+        ctx.setLineWidth(2.0)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+
+        // Lingkaran luar
+        let circleRect = CGRect(x: size.width * 0.12, y: size.height * 0.12, width: size.width * 0.76, height: size.height * 0.76)
+        ctx.strokeEllipse(in: circleRect)
+
+        // Tanda centang di dalam lingkaran
+        ctx.move(to: CGPoint(x: size.width * 0.30, y: size.height * 0.52))
+        ctx.addLine(to: CGPoint(x: size.width * 0.45, y: size.height * 0.67))
+        ctx.addLine(to: CGPoint(x: size.width * 0.72, y: size.height * 0.36))
         ctx.strokePath()
 
         let img = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
@@ -482,7 +517,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         let isDownloaded = PlaylistStorageManager.shared.isAudioDownloaded(song.videoId)
 
         if isDownloading {
-            cell.subtitleLabel.text = "\(song.artist) • Mengunduh audio..."
+            cell.subtitleLabel.text = "\(song.artist) • Mengunduh..."
         } else if song.duration.isEmpty {
             cell.subtitleLabel.text = song.artist
         } else {
@@ -540,7 +575,11 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
         setupUI()
         updateEmptyState()
 
-        // Pastikan lagu lama yang belum punya berkas .m4a otomatis diunduh jika sedang ada internet
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("MetroLitePlaylistsUpdated"), object: nil, queue: .main) { [weak self] _ in
+            self?.tableView.reloadData()
+            self?.updateEmptyState()
+        }
+
         for song in songs where !PlaylistStorageManager.shared.isAudioDownloaded(song.videoId) {
             PlaylistStorageManager.shared.downloadAudioFile(for: song)
         }
@@ -650,9 +689,8 @@ class KoleksiViewController: UIViewController, UITableViewDataSource, UITableVie
         setupNavigationBar()
         setupUI()
 
-        PlaylistStorageManager.shared.onPlaylistsChanged = { [weak self] in
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("MetroLitePlaylistsUpdated"), object: nil, queue: .main) { [weak self] _ in
             self?.reloadPlaylists()
-            NotificationCenter.default.post(name: NSNotification.Name("MetroLitePlaylistsUpdated"), object: nil)
         }
     }
 

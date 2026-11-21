@@ -123,50 +123,81 @@ class InnerTubeService {
         }.resume()
     }
 
-    // Mengambil URL direct audio stream (.m4a) untuk diunduh ke penyimpanan offline
-    func fetchDirectAudioURL(videoId: String, completion: @escaping (URL?) -> Void) {
-        let clientConfigs: [[String: Any]] = [
-            [
-                "clientName": "IOS",
-                "clientVersion": "19.29.1",
-                "deviceMake": "Apple",
-                "deviceModel": "iPhone16,2",
-                "osName": "iOS",
-                "osVersion": "17.5.1.21F90",
-                "hl": "id",
-                "gl": "ID"
-            ],
-            [
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.56.21",
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "androidSdkVersion": 32,
-                "osName": "Android",
-                "osVersion": "12L",
-                "hl": "id",
-                "gl": "ID"
-            ]
+    // Mengembalikan pasangan (URL stream audio langsung, User-Agent yang cocok untuk mengunduhnya)
+    func fetchDirectAudioURL(videoId: String, completion: @escaping (URL?, String) -> Void) {
+        let candidates: [(client: [String: Any], userAgent: String, clientId: String)] = [
+            (
+                client: [
+                    "clientName": "ANDROID_VR",
+                    "clientVersion": "1.60.19",
+                    "deviceMake": "Oculus",
+                    "deviceModel": "Quest 3",
+                    "androidSdkVersion": 32,
+                    "osName": "Android",
+                    "osVersion": "12L",
+                    "hl": "id",
+                    "gl": "ID"
+                ],
+                userAgent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                clientId: "28"
+            ),
+            (
+                client: [
+                    "clientName": "IOS",
+                    "clientVersion": "20.10.4",
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iOS",
+                    "osVersion": "18.3.2.22D82",
+                    "hl": "id",
+                    "gl": "ID"
+                ],
+                userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
+                clientId: "5"
+            ),
+            (
+                client: [
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38",
+                    "androidSdkVersion": 34,
+                    "osName": "Android",
+                    "osVersion": "14",
+                    "hl": "id",
+                    "gl": "ID"
+                ],
+                userAgent: "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+                clientId: "3"
+            )
         ]
 
-        tryFetchAudioWithClient(videoId: videoId, clients: clientConfigs, index: 0, completion: completion)
+        tryFetchAudioWithClient(videoId: videoId, candidates: candidates, index: 0, completion: completion)
     }
 
-    private func tryFetchAudioWithClient(videoId: String, clients: [[String: Any]], index: Int, completion: @escaping (URL?) -> Void) {
-        guard clients.indices.contains(index),
+    private func tryFetchAudioWithClient(
+        videoId: String,
+        candidates: [(client: [String: Any], userAgent: String, clientId: String)],
+        index: Int,
+        completion: @escaping (URL?, String) -> Void
+    ) {
+        guard candidates.indices.contains(index),
               let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
-            DispatchQueue.main.async { completion(nil) }
+            DispatchQueue.main.async { completion(nil, "") }
             return
         }
 
+        let current = candidates[index]
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
-        request.setValue("com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+        request.setValue(current.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(current.clientId, forHTTPHeaderField: "X-YouTube-Client-Name")
+        if let ver = current.client["clientVersion"] as? String {
+            request.setValue(ver, forHTTPHeaderField: "X-YouTube-Client-Version")
+        }
 
         let body: [String: Any] = [
-            "context": ["client": clients[index]],
+            "context": ["client": current.client],
             "videoId": videoId,
             "contentCheckOk": true,
             "racyCheckOk": true
@@ -177,27 +208,45 @@ class InnerTubeService {
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let streamingData = json["streamingData"] as? [String: Any] else {
-                self?.tryFetchAudioWithClient(videoId: videoId, clients: clients, index: index + 1, completion: completion)
+                self?.tryFetchAudioWithClient(videoId: videoId, candidates: candidates, index: index + 1, completion: completion)
                 return
             }
 
             let adaptiveFormats = streamingData["adaptiveFormats"] as? [[String: Any]] ?? []
             let formats = streamingData["formats"] as? [[String: Any]] ?? []
 
-            // Prioritaskan audio/mp4 (m4a / AAC) yang didukung penuh oleh AVPlayer & iOS 12
+            // 1. Cari itag 140 (audio/mp4 128kbps AAC) atau audio/mp4 lainnya yang memiliki direct URL
             var bestAudioURL: String?
             for fmt in adaptiveFormats {
                 if let mime = fmt["mimeType"] as? String,
                    mime.contains("audio/mp4"),
-                   let directUrl = fmt["url"] as? String {
+                   let directUrl = fmt["url"] as? String,
+                   !directUrl.isEmpty {
                     bestAudioURL = directUrl
-                    break
+                    if (fmt["itag"] as? Int) == 140 { break }
                 }
             }
 
+            // 2. Cadangan: format audio apa saja yang punya direct URL
+            if bestAudioURL == nil {
+                for fmt in adaptiveFormats {
+                    if let mime = fmt["mimeType"] as? String,
+                       mime.contains("audio/"),
+                       let directUrl = fmt["url"] as? String,
+                       !directUrl.isEmpty {
+                        bestAudioURL = directUrl
+                        break
+                    }
+                }
+            }
+
+            // 3. Cadangan terakhir: format muxed mp4 (audio+video ringan) agar AVPlayer tetap bisa memutar suaranya
             if bestAudioURL == nil {
                 for fmt in formats {
-                    if let directUrl = fmt["url"] as? String {
+                    if let mime = fmt["mimeType"] as? String,
+                       mime.contains("video/mp4"),
+                       let directUrl = fmt["url"] as? String,
+                       !directUrl.isEmpty {
                         bestAudioURL = directUrl
                         break
                     }
@@ -205,9 +254,9 @@ class InnerTubeService {
             }
 
             if let urlStr = bestAudioURL, let streamURL = URL(string: urlStr) {
-                DispatchQueue.main.async { completion(streamURL) }
+                DispatchQueue.main.async { completion(streamURL, current.userAgent) }
             } else {
-                self?.tryFetchAudioWithClient(videoId: videoId, clients: clients, index: index + 1, completion: completion)
+                self?.tryFetchAudioWithClient(videoId: videoId, candidates: candidates, index: index + 1, completion: completion)
             }
         }.resume()
     }

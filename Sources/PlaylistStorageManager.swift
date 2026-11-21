@@ -55,6 +55,13 @@ class PlaylistStorageManager {
         loadFromDisk()
     }
 
+    private func notifyStateUpdated() {
+        DispatchQueue.main.async {
+            self.onPlaylistsChanged?()
+            NotificationCenter.default.post(name: NSNotification.Name("MetroLitePlaylistsUpdated"), object: nil)
+        }
+    }
+
     private func loadFromDisk() {
         guard let data = try? Data(contentsOf: fileURL),
               let decoded = try? JSONDecoder().decode([UserPlaylist].self, from: data) else {
@@ -68,9 +75,7 @@ class PlaylistStorageManager {
         if let data = try? JSONEncoder().encode(playlists) {
             try? data.write(to: fileURL, options: .atomic)
         }
-        DispatchQueue.main.async {
-            self.onPlaylistsChanged?()
-        }
+        notifyStateUpdated()
     }
 
     @discardableResult
@@ -121,7 +126,7 @@ class PlaylistStorageManager {
               let size = attrs[.size] as? Int64 else {
             return false
         }
-        return size > 50_000
+        return size > 25_000
     }
 
     func localAudioURL(for videoId: String) -> URL? {
@@ -150,28 +155,41 @@ class PlaylistStorageManager {
 
     func downloadAudioFile(for song: SongItem) {
         if isAudioDownloaded(song.videoId) || downloadingIds.contains(song.videoId) {
+            notifyStateUpdated()
             return
         }
         downloadingIds.insert(song.videoId)
-        DispatchQueue.main.async { self.onPlaylistsChanged?() }
+        notifyStateUpdated()
 
-        InnerTubeService.shared.fetchDirectAudioURL(videoId: song.videoId) { [weak self] streamURL in
+        InnerTubeService.shared.fetchDirectAudioURL(videoId: song.videoId) { [weak self] streamURL, matchedUserAgent in
             guard let self = self else { return }
             guard let streamURL = streamURL else {
                 self.downloadingIds.remove(song.videoId)
-                DispatchQueue.main.async { self.onPlaylistsChanged?() }
+                self.notifyStateUpdated()
                 return
             }
 
             var req = URLRequest(url: streamURL)
-            req.setValue("com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+            req.timeoutInterval = 45
+            if !matchedUserAgent.isEmpty {
+                req.setValue(matchedUserAgent, forHTTPHeaderField: "User-Agent")
+            }
 
-            URLSession.shared.downloadTask(with: req) { tempURL, _, _ in
+            URLSession.shared.downloadTask(with: req) { tempURL, response, _ in
                 defer {
                     self.downloadingIds.remove(song.videoId)
-                    DispatchQueue.main.async { self.onPlaylistsChanged?() }
+                    self.notifyStateUpdated()
                 }
-                guard let tempURL = tempURL else { return }
+
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (statusCode == 200 || statusCode == 206),
+                      let tempURL = tempURL,
+                      let attrs = try? FileManager.default.attributesOfItem(atPath: tempURL.path),
+                      let fileSize = attrs[.size] as? Int64,
+                      fileSize > 25_000 else {
+                    return
+                }
+
                 let destURL = self.audioFilePath(for: song.videoId)
                 try? FileManager.default.removeItem(at: destURL)
                 try? FileManager.default.moveItem(at: tempURL, to: destURL)
