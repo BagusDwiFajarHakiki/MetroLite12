@@ -99,10 +99,9 @@ class SongTableViewCell: UITableViewCell {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - Tab 1: Streaming (Grid 2 Kolom di Halaman Awal, Baris di Antrean)
+// MARK: - Tab 1: Streaming (Grid 2 Kolom di Halaman Awal, Baris Bersih di Antrean)
 class StreamingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate {
     private let searchBar = UISearchBar()
-    private let statusBanner = UILabel()
     private var collectionView: UICollectionView!
     private let tableView = UITableView()
     private let gridRefreshControl = UIRefreshControl()
@@ -157,13 +156,6 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         searchBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchBar)
 
-        statusBanner.text = "  Memuat katalog..."
-        statusBanner.textColor = UIColor(white: 0.70, alpha: 1.0)
-        statusBanner.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-        statusBanner.backgroundColor = UIColor(white: 0.11, alpha: 1.0)
-        statusBanner.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(statusBanner)
-
         // 1. Setup Grid 2 Kolom (Halaman Awal & Pencarian)
         let layout = UICollectionViewFlowLayout()
         layout.minimumInteritemSpacing = 10
@@ -184,14 +176,14 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         collectionView.refreshControl = gridRefreshControl
         view.addSubview(collectionView)
 
-        // 2. Setup Baris List (Halaman Antrean Radio)
+        // 2. Setup Baris List (Halaman Antrean Radio — tanpa searchBar & tanpa banner, diberi jarak atas 10pt)
         tableView.dataSource = self
         tableView.delegate = self
         tableView.register(SongTableViewCell.self, forCellReuseIdentifier: "SongCell")
         tableView.rowHeight = 64
         tableView.backgroundColor = .clear
         tableView.separatorColor = UIColor(white: 0.18, alpha: 1.0)
-        tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 62, right: 0)
+        tableView.contentInset = UIEdgeInsets(top: 10, left: 0, bottom: 64, right: 0)
         tableView.scrollIndicatorInsets = tableView.contentInset
         tableView.keyboardDismissMode = .onDrag
         tableView.isHidden = true
@@ -204,17 +196,12 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             searchBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             searchBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            statusBanner.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
-            statusBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            statusBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            statusBanner.heightAnchor.constraint(equalToConstant: 26),
-
-            collectionView.topAnchor.constraint(equalTo: statusBanner.bottomAnchor),
+            collectionView.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
             collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             collectionView.bottomAnchor.constraint(equalTo: guide.bottomAnchor),
 
-            tableView.topAnchor.constraint(equalTo: statusBanner.bottomAnchor),
+            tableView.topAnchor.constraint(equalTo: guide.topAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: guide.bottomAnchor)
@@ -225,14 +212,17 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         isShowingRadioQueue = enabled
         updateBackButtonVisibility()
         if enabled {
+            title = "Antrean"
+            searchBar.isHidden = true
+            searchBar.resignFirstResponder()
             collectionView.isHidden = true
             tableView.isHidden = false
-            statusBanner.text = "  Antrean Radio Sejenis (\(queueSongs.count) lagu)"
             tableView.reloadData()
         } else {
+            title = "Streaming"
+            searchBar.isHidden = false
             tableView.isHidden = true
             collectionView.isHidden = false
-            statusBanner.text = "  \(lastQuery) (\(browseSongs.count) lagu)"
             collectionView.reloadData()
         }
     }
@@ -285,27 +275,15 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
 
     private func performSearch(query: String, isRefresh: Bool) {
         lastQuery = query
-        isShowingRadioQueue = false
-        updateBackButtonVisibility()
-        tableView.isHidden = true
-        collectionView.isHidden = false
-        if !isRefresh {
-            statusBanner.text = "  Mencari: \(query)..."
-        }
+        switchToQueueMode(false)
 
-        InnerTubeService.shared.searchSongs(query: query) { [weak self] results, errorMsg in
+        InnerTubeService.shared.searchSongs(query: query) { [weak self] results, _ in
             guard let self = self else { return }
             self.gridRefreshControl.endRefreshing()
 
             let finalResults = isRefresh ? results.shuffled() : results
             self.browseSongs = finalResults
             self.collectionView.reloadData()
-
-            if let errorMsg = errorMsg {
-                self.statusBanner.text = "  \(errorMsg)"
-            } else {
-                self.statusBanner.text = "  \(query) (\(finalResults.count) lagu)"
-            }
         }
     }
 
@@ -317,7 +295,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         }
     }
 
-    // MARK: - UISearchBarDelegate (Tutup keyboard responsif)
+    // MARK: - UISearchBarDelegate
     func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
         searchBar.setShowsCancelButton(true, animated: true)
     }
