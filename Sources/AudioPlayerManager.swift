@@ -36,8 +36,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // Wajib options: [] (tanpa .mixWithOthers) agar iOS 12 mengaktifkan Next/Previous & Artwork di Lock Screen
-            try session.setCategory(.playback, mode: .default, options: [])
+            // .mixWithOthers wajib aktif agar silentPlayer dan WKWebView berjalan bersamaan tanpa saling memutus saat layar mati
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
@@ -68,7 +68,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
         if let player = try? AVAudioPlayer(data: header) {
             player.numberOfLoops = -1
-            player.volume = 0.02
+            player.volume = 0.01
             player.prepareToPlay()
             silentPlayer = player
         }
@@ -76,7 +76,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func updateAnchorState() {
         if isPlaying {
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try? AVAudioSession.sharedInstance().setActive(true)
             if silentPlayer?.isPlaying == false {
                 silentPlayer?.play()
@@ -131,17 +131,26 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.__qualitySetForSrc = "";
             window.__savedTime = 0;
             window.__songMeta = { title: "MetroLite 12", artist: "YouTube Music", artwork: "" };
+            window.__mediaHandlersBound = false;
 
             window.__applyWebMediaSession = function() {
-                if ('mediaSession' in navigator) {
-                    try {
-                        navigator.mediaSession.metadata = new MediaMetadata({
-                            title: window.__songMeta.title,
-                            artist: window.__songMeta.artist,
-                            album: 'MetroLite 12',
-                            artwork: window.__songMeta.artwork ? [{ src: window.__songMeta.artwork, sizes: '300x300', type: 'image/jpeg' }] : []
-                        });
-                        navigator.mediaSession.playbackState = window.__userPaused ? 'paused' : 'playing';
+                if (!('mediaSession' in navigator)) return;
+                try {
+                    navigator.mediaSession.metadata = new MediaMetadata({
+                        title: window.__songMeta.title,
+                        artist: window.__songMeta.artist,
+                        album: 'MetroLite 12',
+                        artwork: window.__songMeta.artwork ? [
+                            { src: window.__songMeta.artwork, sizes: '96x96', type: 'image/jpeg' },
+                            { src: window.__songMeta.artwork, sizes: '128x128', type: 'image/jpeg' },
+                            { src: window.__songMeta.artwork, sizes: '256x256', type: 'image/jpeg' },
+                            { src: window.__songMeta.artwork, sizes: '512x512', type: 'image/jpeg' }
+                        ] : []
+                    });
+                    navigator.mediaSession.playbackState = window.__userPaused ? 'paused' : 'playing';
+
+                    if (!window.__mediaHandlersBound) {
+                        window.__mediaHandlersBound = true;
                         navigator.mediaSession.setActionHandler('play', function() {
                             window.__userPaused = false;
                             var v = document.querySelector('video');
@@ -160,8 +169,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         navigator.mediaSession.setActionHandler('previoustrack', function() {
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePrev' });
                         });
-                    } catch(e) {}
-                }
+                    }
+                } catch(e) {}
             };
             
             setInterval(function() {
@@ -485,6 +494,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing", "remotePlay":
             isPlaying = true
+            updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused", "remotePause":
@@ -508,18 +518,12 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if self.silentPlayer?.isPlaying == false {
                 self.silentPlayer?.play()
             }
-            if let song = self.currentSong {
-                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
-            }
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             if self.silentPlayer?.isPlaying == false {
                 self.silentPlayer?.play()
-            }
-            if let song = self.currentSong {
-                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
             }
             let resumeJS = """
             (function() {
@@ -564,7 +568,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentPlaybackTime
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
         if let image = image {
-            let artwork = MPMediaItemArtwork(boundsSize: CGSize(width: 300, height: 300)) { _ in return image }
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
             info[MPMediaItemPropertyArtwork] = artwork
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
