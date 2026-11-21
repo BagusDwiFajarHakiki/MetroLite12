@@ -51,7 +51,7 @@ class SongGridCollectionViewCell: UICollectionViewCell {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - Cell Baris untuk Halaman Antrean & Koleksi (Dengan Tombol Download Opsional)
+// MARK: - Cell Baris untuk Halaman Antrean & Koleksi
 class SongTableViewCell: UITableViewCell {
     let thumbImageView = UIImageView()
     let titleLabel = UILabel()
@@ -115,11 +115,17 @@ class SongTableViewCell: UITableViewCell {
         ])
     }
 
-    func setShowDownloadButton(_ show: Bool, isSaved: Bool = false) {
+    func setShowDownloadButton(_ show: Bool, isDownloaded: Bool = false, isDownloading: Bool = false) {
         downloadButton.isHidden = !show
         titleTrailingToDownload.isActive = show
         titleTrailingToEdge.isActive = !show
-        downloadButton.tintColor = isSaved ? UIColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1.0) : .lightGray
+        if isDownloading {
+            downloadButton.tintColor = UIColor(red: 1.0, green: 0.75, blue: 0.2, alpha: 1.0)
+        } else if isDownloaded {
+            downloadButton.tintColor = UIColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1.0)
+        } else {
+            downloadButton.tintColor = .lightGray
+        }
     }
 
     @objc private func didTapDownload() {
@@ -134,14 +140,12 @@ class SongTableViewCell: UITableViewCell {
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
 
-        // Panah ke bawah
         ctx.move(to: CGPoint(x: size.width * 0.50, y: size.height * 0.16))
         ctx.addLine(to: CGPoint(x: size.width * 0.50, y: size.height * 0.64))
         ctx.move(to: CGPoint(x: size.width * 0.30, y: size.height * 0.46))
         ctx.addLine(to: CGPoint(x: size.width * 0.50, y: size.height * 0.66))
         ctx.addLine(to: CGPoint(x: size.width * 0.70, y: size.height * 0.46))
 
-        // Garis wadah bawah
         ctx.move(to: CGPoint(x: size.width * 0.22, y: size.height * 0.82))
         ctx.addLine(to: CGPoint(x: size.width * 0.78, y: size.height * 0.82))
         ctx.strokePath()
@@ -154,7 +158,7 @@ class SongTableViewCell: UITableViewCell {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - Tab 1: Streaming (Grid 2 Kolom di Halaman Awal, Baris Bersih + Download di Antrean)
+// MARK: - Tab 1: Streaming
 class StreamingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate {
     private let searchBar = UISearchBar()
     private var collectionView: UICollectionView!
@@ -193,7 +197,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             self.switchToQueueMode(true)
         }
 
-        PlaylistStorageManager.shared.onPlaylistsChanged = { [weak self] in
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("MetroLitePlaylistsUpdated"), object: nil, queue: .main) { [weak self] _ in
             self?.refreshActiveList()
         }
 
@@ -215,7 +219,6 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         searchBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchBar)
 
-        // 1. Setup Grid 2 Kolom (Halaman Awal & Pencarian)
         let layout = UICollectionViewFlowLayout()
         layout.minimumInteritemSpacing = 10
         layout.minimumLineSpacing = 12
@@ -235,7 +238,6 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         collectionView.refreshControl = gridRefreshControl
         view.addSubview(collectionView)
 
-        // 2. Setup Baris List (Halaman Antrean Radio)
         tableView.dataSource = self
         tableView.delegate = self
         tableView.register(SongTableViewCell.self, forCellReuseIdentifier: "SongCell")
@@ -354,12 +356,11 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         }
     }
 
-    // Popup pemilihan playlist saat tombol Download di antrean ditekan
     private func presentSaveToPlaylistPopup(for song: SongItem) {
         let playlists = PlaylistStorageManager.shared.playlists
         let alert = UIAlertController(
-            title: "Simpan ke Playlist",
-            message: "Pilih playlist untuk menyimpan \"\(song.title)\":",
+            title: "Unduh ke Playlist",
+            message: "Pilih playlist untuk menyimpan audio offline \"\(song.title)\":",
             preferredStyle: .alert
         )
 
@@ -385,7 +386,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             tf.placeholder = "Contoh: Favoritku"
             tf.autocapitalizationType = .words
         }
-        alert.addAction(UIAlertAction(title: "Simpan", style: .default) { [weak self] _ in
+        alert.addAction(UIAlertAction(title: "Unduh & Simpan", style: .default) { [weak self] _ in
             let name = alert.textFields?.first?.text ?? "Playlist Baru"
             let created = PlaylistStorageManager.shared.createPlaylist(name: name)
             PlaylistStorageManager.shared.addSong(song, toPlaylistId: created.id)
@@ -397,7 +398,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
     }
 
     private func showSavedBanner(playlistName: String) {
-        let toast = UIAlertController(title: nil, message: "Tersimpan ke \"\(playlistName)\"", preferredStyle: .alert)
+        let toast = UIAlertController(title: nil, message: "Mengunduh ke \"\(playlistName)\"...", preferredStyle: .alert)
         present(toast, animated: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
             toast.dismiss(animated: true)
@@ -428,7 +429,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         }
     }
 
-    // MARK: - UICollectionViewDataSource & FlowLayout (Grid 2 Kolom Halaman Awal)
+    // MARK: - UICollectionViewDataSource & FlowLayout
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
         return browseSongs.count
     }
@@ -466,7 +467,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         AudioPlayerManager.shared.startRadioWithSong(selectedSong)
     }
 
-    // MARK: - UITableViewDataSource & Delegate (Daftar Baris Antrean + Download)
+    // MARK: - UITableViewDataSource & Delegate
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         return queueSongs.count
     }
@@ -476,15 +477,20 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         let song = queueSongs[indexPath.row]
         cell.currentVideoId = song.videoId
         cell.titleLabel.text = song.title
-        if song.duration.isEmpty {
+
+        let isDownloading = PlaylistStorageManager.shared.downloadingIds.contains(song.videoId)
+        let isDownloaded = PlaylistStorageManager.shared.isAudioDownloaded(song.videoId)
+
+        if isDownloading {
+            cell.subtitleLabel.text = "\(song.artist) • Mengunduh audio..."
+        } else if song.duration.isEmpty {
             cell.subtitleLabel.text = song.artist
         } else {
             cell.subtitleLabel.text = "\(song.artist) • \(song.duration)"
         }
         cell.thumbImageView.image = nil
 
-        let isSaved = PlaylistStorageManager.shared.isSongSaved(song.videoId)
-        cell.setShowDownloadButton(true, isSaved: isSaved)
+        cell.setShowDownloadButton(true, isDownloaded: isDownloaded, isDownloading: isDownloading)
         cell.onDownloadTapped = { [weak self] in
             self?.presentSaveToPlaylistPopup(for: song)
         }
@@ -533,6 +539,11 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
         view.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
         setupUI()
         updateEmptyState()
+
+        // Pastikan lagu lama yang belum punya berkas .m4a otomatis diunduh jika sedang ada internet
+        for song in songs where !PlaylistStorageManager.shared.isAudioDownloaded(song.videoId) {
+            PlaylistStorageManager.shared.downloadAudioFile(for: song)
+        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -553,7 +564,7 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
         tableView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(tableView)
 
-        emptyLabel.text = "Belum ada lagu di playlist ini.\nSimpan lagu dari halaman Antrean."
+        emptyLabel.text = "Belum ada lagu di playlist ini.\nUnduh lagu dari halaman Antrean."
         emptyLabel.textColor = .lightGray
         emptyLabel.font = UIFont.systemFont(ofSize: 14, weight: .regular)
         emptyLabel.textAlignment = .center
@@ -588,7 +599,12 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
         let song = songs[indexPath.row]
         cell.currentVideoId = song.videoId
         cell.titleLabel.text = song.title
-        cell.subtitleLabel.text = song.duration.isEmpty ? song.artist : "\(song.artist) • \(song.duration)"
+
+        let isDownloaded = PlaylistStorageManager.shared.isAudioDownloaded(song.videoId)
+        let isDownloading = PlaylistStorageManager.shared.downloadingIds.contains(song.videoId)
+        let statusTag = isDownloaded ? "Offline" : (isDownloading ? "Mengunduh..." : "Belum terunduh")
+        let baseMeta = song.duration.isEmpty ? song.artist : "\(song.artist) • \(song.duration)"
+        cell.subtitleLabel.text = "\(baseMeta) • \(statusTag)"
         cell.setShowDownloadButton(false)
 
         let isCurrent = AudioPlayerManager.shared.currentSong?.videoId == song.videoId
@@ -622,7 +638,7 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
     }
 }
 
-// MARK: - Tab 2: Koleksi (Daftar Playlist & Tombol Buat Playlist)
+// MARK: - Tab 2: Koleksi
 class KoleksiViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
     private let tableView = UITableView()
     private let emptyLabel = UILabel()
@@ -636,6 +652,7 @@ class KoleksiViewController: UIViewController, UITableViewDataSource, UITableVie
 
         PlaylistStorageManager.shared.onPlaylistsChanged = { [weak self] in
             self?.reloadPlaylists()
+            NotificationCenter.default.post(name: NSNotification.Name("MetroLitePlaylistsUpdated"), object: nil)
         }
     }
 

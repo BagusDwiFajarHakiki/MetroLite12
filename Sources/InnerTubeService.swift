@@ -123,6 +123,95 @@ class InnerTubeService {
         }.resume()
     }
 
+    // Mengambil URL direct audio stream (.m4a) untuk diunduh ke penyimpanan offline
+    func fetchDirectAudioURL(videoId: String, completion: @escaping (URL?) -> Void) {
+        let clientConfigs: [[String: Any]] = [
+            [
+                "clientName": "IOS",
+                "clientVersion": "19.29.1",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iOS",
+                "osVersion": "17.5.1.21F90",
+                "hl": "id",
+                "gl": "ID"
+            ],
+            [
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.56.21",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": 32,
+                "osName": "Android",
+                "osVersion": "12L",
+                "hl": "id",
+                "gl": "ID"
+            ]
+        ]
+
+        tryFetchAudioWithClient(videoId: videoId, clients: clientConfigs, index: 0, completion: completion)
+    }
+
+    private func tryFetchAudioWithClient(videoId: String, clients: [[String: Any]], index: Int, completion: @escaping (URL?) -> Void) {
+        guard clients.indices.contains(index),
+              let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        request.setValue("com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        let body: [String: Any] = [
+            "context": ["client": clients[index]],
+            "videoId": videoId,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let streamingData = json["streamingData"] as? [String: Any] else {
+                self?.tryFetchAudioWithClient(videoId: videoId, clients: clients, index: index + 1, completion: completion)
+                return
+            }
+
+            let adaptiveFormats = streamingData["adaptiveFormats"] as? [[String: Any]] ?? []
+            let formats = streamingData["formats"] as? [[String: Any]] ?? []
+
+            // Prioritaskan audio/mp4 (m4a / AAC) yang didukung penuh oleh AVPlayer & iOS 12
+            var bestAudioURL: String?
+            for fmt in adaptiveFormats {
+                if let mime = fmt["mimeType"] as? String,
+                   mime.contains("audio/mp4"),
+                   let directUrl = fmt["url"] as? String {
+                    bestAudioURL = directUrl
+                    break
+                }
+            }
+
+            if bestAudioURL == nil {
+                for fmt in formats {
+                    if let directUrl = fmt["url"] as? String {
+                        bestAudioURL = directUrl
+                        break
+                    }
+                }
+            }
+
+            if let urlStr = bestAudioURL, let streamURL = URL(string: urlStr) {
+                DispatchQueue.main.async { completion(streamURL) }
+            } else {
+                self?.tryFetchAudioWithClient(videoId: videoId, clients: clients, index: index + 1, completion: completion)
+            }
+        }.resume()
+    }
+
     private func makeBaseRequest(url: URL) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -179,7 +268,6 @@ class InnerTubeService {
         }
     }
 
-    // Memisahkan nama artis dan durasi (format mm:ss) serta membuang tahun rilis/label tipe
     private func parseArtistAndDuration(from raw: String, fallbackDuration: String = "") -> (artist: String, duration: String) {
         let parts = raw.components(separatedBy: "•").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         var foundDuration = fallbackDuration
@@ -188,12 +276,10 @@ class InnerTubeService {
         let ignoredLabels: Set<String> = ["Lagu", "Song", "Video", "Single", "Album", "EP"]
 
         for part in parts {
-            // Cek apakah bagian ini adalah durasi (contoh: 3:45 atau 1:02:10)
             if part.range(of: #"^\d{1,2}:\d{2}(:\d{2})?$"#, options: .regularExpression) != nil {
                 foundDuration = part
                 continue
             }
-            // Abaikan tahun 4 digit (contoh: 2024, 2026) atau label kategori
             if part.range(of: #"^(19|20)\d{2}$"#, options: .regularExpression) != nil || ignoredLabels.contains(part) {
                 continue
             }

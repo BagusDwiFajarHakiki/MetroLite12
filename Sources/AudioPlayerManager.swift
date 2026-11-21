@@ -8,6 +8,10 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     private var webView: WKWebView!
     private var silentPlayer: AVAudioPlayer?
+    private var nativeOfflinePlayer: AVPlayer?
+    private var offlineEndObserver: Any?
+    private var isUsingOfflinePlayer = false
+
     private var nativeAutoNextTimer: Timer?
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
@@ -78,12 +82,35 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
+    private func stopNativeOfflinePlayer() {
+        if let observer = offlineEndObserver {
+            NotificationCenter.default.removeObserver(observer)
+            offlineEndObserver = nil
+        }
+        nativeOfflinePlayer?.pause()
+        nativeOfflinePlayer = nil
+        isUsingOfflinePlayer = false
+    }
+
     private func startNativeAutoNextWatchdog() {
         nativeAutoNextTimer?.invalidate()
         nativeAutoNextTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if self.isPlaying && self.silentPlayer?.isPlaying == false {
                 self.silentPlayer?.play()
+            }
+
+            if self.isUsingOfflinePlayer, let player = self.nativeOfflinePlayer {
+                let ct = CMTimeGetSeconds(player.currentTime())
+                if ct.isFinite && ct >= 0 { self.currentPlaybackTime = ct }
+                if let item = player.currentItem {
+                    let dur = CMTimeGetSeconds(item.duration)
+                    if dur.isFinite && dur > 1.0 { self.currentDuration = dur }
+                }
+                if let song = self.currentSong {
+                    self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
+                }
+                return
             }
 
             if let song = self.currentSong {
@@ -100,7 +127,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 }
                 if (!v) return 'no_video';
 
-                // Paksa play baik melalui API movie_player maupun elemen <video> jika lagu baru belum berputar
                 if (v.paused && !v.ended) {
                     if (player && typeof player.playVideo === 'function') {
                         try { player.playVideo(); } catch(e) {}
@@ -121,7 +147,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             })();
             """
             self.webView.evaluateJavaScript(probeJS) { [weak self] result, _ in
-                guard let self = self,
+                guard let self = self, !self.isUsingOfflinePlayer,
                       let statusStr = result as? String else { return }
 
                 if statusStr == "user_paused" {
@@ -139,7 +165,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         let webIsPlaying = (parts[0] == "playing")
                         if ct > 0.2 { self.currentPlaybackTime = ct }
                         if dur > 5.0 { self.currentDuration = dur }
-                        // Sinkronkan status tombol mini-player jika WebKit berubah status dari Control Center
                         if webIsPlaying != self.isPlaying && !self.isTransitioningTrack {
                             self.syncUIState(playing: webIsPlaying)
                         }
@@ -262,7 +287,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     } catch(e) {}
                 }
 
-                // Saat memuat lagu baru atau dalam jendela kunci layar, terus dorong pemutaran sampai audio jalan
                 if (video.paused && !video.ended && !window.__endedTriggered && (window.__loadingNewTrack || Date.now() <= window.__autoPlayGraceUntil)) {
                     var player = document.getElementById('movie_player');
                     if (player && typeof player.playVideo === 'function') {
@@ -303,7 +327,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     video.__hooked = true;
                     video.addEventListener('play', function() {
                         window.__userPaused = false;
-                        // Segera beri tahu Swift agar ikon mini-player berubah ke Pause saat Play ditekan dari Control Center/Lock Screen
                         window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
                     });
                     video.addEventListener('pause', function() {
@@ -402,9 +425,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             playedHistory.insert(nextSong.videoId)
             play(song: nextSong)
 
-            if queue.count - nextIndex <= 2 {
+            if queue.count - nextIndex <= 2 && !isUsingOfflinePlayer {
                 fetchMoreRelated(basedOn: nextSong)
             }
+        } else if isUsingOfflinePlayer {
+            // Ulangi dari lagu pertama dalam playlist offline jika sudah mencapai akhir daftar
+            currentIndex = 0
+            play(song: queue[0])
         } else if let lastSong = currentSong {
             onStateChanged?(true, "Mencari lagu sejenis...", currentArtworkImage)
             InnerTubeService.shared.fetchRelatedSongs(videoId: lastSong.videoId) { [weak self] related in
@@ -458,17 +485,34 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             silentPlayer?.play()
         }
         startNativeAutoNextWatchdog()
-        updateNowPlayingInfo(song: song, image: nil)
-        onStateChanged?(true, "Memuat: \(song.title)...", nil)
 
-        ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
-            guard let self = self, self.currentSong?.videoId == song.videoId else { return }
-            let squareArt = self.makeSquareArtwork(from: image)
+        // Muat artwork dari cache lokal terlebih dahulu jika tersedia (offline), jika tidak unduh dari jaringan
+        if let localThumb = PlaylistStorageManager.shared.loadLocalThumbnail(videoId: song.videoId) {
+            let squareArt = makeSquareArtwork(from: localThumb)
             self.currentArtworkImage = squareArt
-            self.updateNowPlayingInfo(song: song, image: squareArt)
-            let statusText = self.isPlaying ? "\(song.title) - \(song.artist)" : "\(song.title)"
-            self.onStateChanged?(self.isPlaying, statusText, squareArt)
+            updateNowPlayingInfo(song: song, image: squareArt)
+            onStateChanged?(true, "\(song.title) - \(song.artist)", squareArt)
+        } else {
+            updateNowPlayingInfo(song: song, image: nil)
+            onStateChanged?(true, "Memuat: \(song.title)...", nil)
+            ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
+                guard let self = self, self.currentSong?.videoId == song.videoId else { return }
+                let squareArt = self.makeSquareArtwork(from: image)
+                self.currentArtworkImage = squareArt
+                self.updateNowPlayingInfo(song: song, image: squareArt)
+                let statusText = self.isPlaying ? "\(song.title) - \(song.artist)" : "\(song.title)"
+                self.onStateChanged?(self.isPlaying, statusText, squareArt)
+            }
         }
+
+        // Cek apakah file audio lokal (.m4a) sudah tersedia di penyimpanan perangkat
+        if let offlineFileURL = PlaylistStorageManager.shared.localAudioURL(for: song.videoId) {
+            playOfflineFile(url: offlineFileURL, song: song)
+            return
+        }
+
+        // Jika tidak ada file lokal, hentikan player offline dan gunakan streaming WKWebView
+        stopNativeOfflinePlayer()
 
         if isPlayerPageLoaded {
             let loadByIdJS = """
@@ -504,6 +548,35 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
+    private func playOfflineFile(url: URL, song: SongItem) {
+        stopNativeOfflinePlayer()
+        // Hentikan video webview agar suara tidak bertumpuk
+        let pauseWebJS = "window.__userPaused = true; window.__loadingNewTrack = false; var v = document.querySelector('video'); if(v) { if(window.__origMediaPause) window.__origMediaPause.call(v); else v.pause(); }"
+        webView.evaluateJavaScript(pauseWebJS, completionHandler: nil)
+
+        isUsingOfflinePlayer = true
+        isTransitioningTrack = false
+
+        let item = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: item)
+        player.volume = 1.0
+        nativeOfflinePlayer = player
+
+        offlineEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, self.isUsingOfflinePlayer else { return }
+            self.isTransitioningTrack = true
+            self.playNext()
+        }
+
+        player.play()
+        onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
+        updateNowPlayingInfo(song: song, image: currentArtworkImage)
+    }
+
     private func makeSquareArtwork(from image: UIImage?) -> UIImage? {
         guard let image = image else { return nil }
         let targetSize = CGSize(width: 300, height: 300)
@@ -535,7 +608,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isPlayerPageLoaded = true
-        if isPlaying, let vid = currentSong?.videoId {
+        if isPlaying && !isUsingOfflinePlayer, let vid = currentSong?.videoId {
             let forcePlayJS = "window.__userPaused = false; window.__loadingNewTrack = true; window.__autoPlayGraceUntil = Date.now() + 6000; window.__targetVideoId = '\(vid)'; var v = document.querySelector('video'); if(v) { v.muted = false; v.volume = 1.0; v.play().catch(function(e){}); }"
             webView.evaluateJavaScript(forcePlayJS, completionHandler: nil)
         }
@@ -545,6 +618,14 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         guard let song = currentSong else { return }
         isPlaying = false
         lastUserPauseTimestamp = Date()
+
+        if isUsingOfflinePlayer {
+            nativeOfflinePlayer?.pause()
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
+            onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
+            return
+        }
+
         let pauseJS = """
         window.__userPaused = true;
         window.__loadingNewTrack = false;
@@ -567,6 +648,14 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             silentPlayer?.play()
         }
         startNativeAutoNextWatchdog()
+
+        if isUsingOfflinePlayer {
+            nativeOfflinePlayer?.play()
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
+            onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
+            return
+        }
+
         let playJS = """
         window.__userPaused = false;
         window.__autoPlayGraceUntil = Date.now() + 2000;
@@ -591,7 +680,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any],
+        guard !isUsingOfflinePlayer,
+              let body = message.body as? [String: Any],
               let status = body["status"] as? String,
               let song = currentSong else { return }
 
@@ -630,7 +720,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if self.silentPlayer?.isPlaying == false {
                 self.silentPlayer?.play()
             }
-            self.webView.evaluateJavaScript("window.__userPaused = false; window.__autoPlayGraceUntil = Date.now() + 1500; var v = document.querySelector('video'); if(v && v.paused) v.play().catch(function(e){});", completionHandler: nil)
+            if !self.isUsingOfflinePlayer {
+                self.webView.evaluateJavaScript("window.__userPaused = false; window.__autoPlayGraceUntil = Date.now() + 1500; var v = document.querySelector('video'); if(v && v.paused) v.play().catch(function(e){});", completionHandler: nil)
+            }
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
@@ -639,7 +731,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if self.silentPlayer?.isPlaying == false {
                 self.silentPlayer?.play()
             }
-            self.webView.evaluateJavaScript("window.__userPaused = false; window.__autoPlayGraceUntil = Date.now() + 1500; var v = document.querySelector('video'); if(v && v.paused) v.play().catch(function(e){});", completionHandler: nil)
+            if !self.isUsingOfflinePlayer {
+                self.webView.evaluateJavaScript("window.__userPaused = false; window.__autoPlayGraceUntil = Date.now() + 1500; var v = document.querySelector('video'); if(v && v.paused) v.play().catch(function(e){});", completionHandler: nil)
+            }
             if let song = self.currentSong {
                 self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
             }
