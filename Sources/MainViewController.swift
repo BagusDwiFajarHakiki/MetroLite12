@@ -124,15 +124,12 @@ class SongTableViewCell: UITableViewCell {
         titleTrailingToEdge.isActive = !show
 
         if isDownloading {
-            // Sedang mengunduh: ikon download berwarna oranye
             downloadButton.setImage(SongTableViewCell.idleDownloadIcon, for: .normal)
             downloadButton.tintColor = UIColor.orange
         } else if isDownloaded {
-            // Berhasil terunduh: ikon centang di dalam lingkaran berwarna hijau
             downloadButton.setImage(SongTableViewCell.completedCheckCircleIcon, for: .normal)
             downloadButton.tintColor = UIColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1.0)
         } else {
-            // Belum diunduh: ikon download abu-abu
             downloadButton.setImage(SongTableViewCell.idleDownloadIcon, for: .normal)
             downloadButton.tintColor = .lightGray
         }
@@ -142,7 +139,6 @@ class SongTableViewCell: UITableViewCell {
         onDownloadTapped?()
     }
 
-    // Ikon vektor panah ke bawah (belum / sedang mengunduh)
     private static func makeDownloadIcon(size: CGSize) -> UIImage? {
         UIGraphicsBeginImageContextWithOptions(size, false, 0)
         guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
@@ -166,7 +162,6 @@ class SongTableViewCell: UITableViewCell {
         return img
     }
 
-    // Ikon vektor centang di dalam lingkaran (berhasil terunduh)
     private static func makeDownloadedCheckIcon(size: CGSize) -> UIImage? {
         UIGraphicsBeginImageContextWithOptions(size, false, 0)
         guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
@@ -175,11 +170,9 @@ class SongTableViewCell: UITableViewCell {
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
 
-        // Lingkaran luar
         let circleRect = CGRect(x: size.width * 0.12, y: size.height * 0.12, width: size.width * 0.76, height: size.height * 0.76)
         ctx.strokeEllipse(in: circleRect)
 
-        // Tanda centang di dalam lingkaran
         ctx.move(to: CGPoint(x: size.width * 0.30, y: size.height * 0.52))
         ctx.addLine(to: CGPoint(x: size.width * 0.45, y: size.height * 0.67))
         ctx.addLine(to: CGPoint(x: size.width * 0.72, y: size.height * 0.36))
@@ -518,6 +511,8 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
 
         if isDownloading {
             cell.subtitleLabel.text = "\(song.artist) • Mengunduh..."
+        } else if let err = PlaylistStorageManager.shared.downloadErrors[song.videoId] {
+            cell.subtitleLabel.text = "\(song.artist) • \(err)"
         } else if song.duration.isEmpty {
             cell.subtitleLabel.text = song.artist
         } else {
@@ -641,7 +636,8 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
 
         let isDownloaded = PlaylistStorageManager.shared.isAudioDownloaded(song.videoId)
         let isDownloading = PlaylistStorageManager.shared.downloadingIds.contains(song.videoId)
-        let statusTag = isDownloaded ? "Offline" : (isDownloading ? "Mengunduh..." : "Belum terunduh")
+        let errReason = PlaylistStorageManager.shared.downloadErrors[song.videoId]
+        let statusTag = isDownloaded ? "Offline" : (isDownloading ? "Mengunduh..." : (errReason ?? "Belum terunduh"))
         let baseMeta = song.duration.isEmpty ? song.artist : "\(song.artist) • \(song.duration)"
         cell.subtitleLabel.text = "\(baseMeta) • \(statusTag)"
         cell.setShowDownloadButton(false)
@@ -664,6 +660,10 @@ class PlaylistDetailViewController: UIViewController, UITableViewDataSource, UIT
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+        let song = songs[indexPath.row]
+        if !PlaylistStorageManager.shared.isAudioDownloaded(song.videoId) {
+            PlaylistStorageManager.shared.downloadAudioFile(for: song)
+        }
         AudioPlayerManager.shared.playFromQueue(songs: songs, at: indexPath.row)
         tableView.reloadData()
     }
