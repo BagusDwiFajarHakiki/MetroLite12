@@ -54,6 +54,7 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
     private let miniThumbView = UIImageView()
     private let nowPlayingLabel = UILabel()
     private let playPauseButton = UIButton(type: .system)
+    private let nextButton = UIButton(type: .system)
 
     private var songs: [SongItem] = []
 
@@ -69,6 +70,7 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
             if let artwork = artwork {
                 self?.miniThumbView.image = artwork
             }
+            self?.tableView.reloadData()
         }
 
         performSearch(query: "Lagu Pop Indonesia Hits")
@@ -113,10 +115,18 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
         playerBar.addSubview(nowPlayingLabel)
 
         playPauseButton.setTitle("Play", for: .normal)
+        playPauseButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .bold)
         playPauseButton.tintColor = .white
         playPauseButton.addTarget(self, action: #selector(didTapPlayPause), for: .touchUpInside)
         playPauseButton.translatesAutoresizingMaskIntoConstraints = false
         playerBar.addSubview(playPauseButton)
+
+        nextButton.setTitle("Next", for: .normal)
+        nextButton.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .bold)
+        nextButton.tintColor = .white
+        nextButton.addTarget(self, action: #selector(didTapNext), for: .touchUpInside)
+        nextButton.translatesAutoresizingMaskIntoConstraints = false
+        playerBar.addSubview(nextButton)
 
         let guide = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -134,13 +144,17 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
             miniThumbView.widthAnchor.constraint(equalToConstant: 42),
             miniThumbView.heightAnchor.constraint(equalToConstant: 42),
 
+            nextButton.trailingAnchor.constraint(equalTo: playerBar.trailingAnchor, constant: -10),
+            nextButton.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
+            nextButton.widthAnchor.constraint(equalToConstant: 46),
+
+            playPauseButton.trailingAnchor.constraint(equalTo: nextButton.leadingAnchor, constant: -4),
+            playPauseButton.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
+            playPauseButton.widthAnchor.constraint(equalToConstant: 52),
+
             nowPlayingLabel.leadingAnchor.constraint(equalTo: miniThumbView.trailingAnchor, constant: 10),
             nowPlayingLabel.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
-            nowPlayingLabel.trailingAnchor.constraint(equalTo: playPauseButton.leadingAnchor, constant: -8),
-
-            playPauseButton.trailingAnchor.constraint(equalTo: playerBar.trailingAnchor, constant: -14),
-            playPauseButton.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
-            playPauseButton.widthAnchor.constraint(equalToConstant: 56),
+            nowPlayingLabel.trailingAnchor.constraint(equalTo: playPauseButton.leadingAnchor, constant: -6),
 
             tableView.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -151,6 +165,10 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
 
     @objc private func didTapPlayPause() {
         AudioPlayerManager.shared.togglePlayPause()
+    }
+
+    @objc private func didTapNext() {
+        AudioPlayerManager.shared.playNext()
     }
 
     private func performSearch(query: String) {
@@ -186,6 +204,10 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
         cell.artistLabel.text = song.artist
         cell.thumbImageView.image = nil
 
+        // Tandai judul lagu yang sedang diputar dengan warna aksen hijau
+        let isCurrent = AudioPlayerManager.shared.currentSong?.videoId == song.videoId
+        cell.titleLabel.textColor = isCurrent ? UIColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1.0) : .white
+
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { image in
             if cell.currentVideoId == song.videoId {
                 cell.thumbImageView.image = image
@@ -196,7 +218,6 @@ class MainViewController: UIViewController, UITableViewDataSource, UITableViewDe
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        let song = songs[indexPath.row]
-        AudioPlayerManager.shared.play(song: song)
+        AudioPlayerManager.shared.playFromQueue(songs: songs, at: indexPath.row)
     }
 }

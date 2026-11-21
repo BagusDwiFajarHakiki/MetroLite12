@@ -11,6 +11,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private var nowPlayingTimer: Timer?
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
+    
+    // Antrean (Queue) lagu untuk fitur Next, Previous, dan Auto-Play
+    private(set) var queue: [SongItem] = []
+    private(set) var currentIndex: Int = -1
+    
     private var isPlayerPageLoaded = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     
@@ -39,7 +44,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    // Menjaga sesi audio native iOS 12 tetap aktif agar tidak terputus saat layar dikunci
     private func setupSilentAnchorPlayer() {
         let sampleRate: Int32 = 8000
         let numSamples: Int32 = 8000
@@ -131,6 +135,40 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         (function() {
             window.__userPaused = false;
             window.__reportedPlayingForSrc = "";
+            window.__reportedEndedForSrc = "";
+            window.__songMeta = { title: "MetroLite 12", artist: "YouTube Music", artwork: "" };
+
+            window.__applyWebMediaSession = function() {
+                if ('mediaSession' in navigator) {
+                    try {
+                        navigator.mediaSession.metadata = new MediaMetadata({
+                            title: window.__songMeta.title,
+                            artist: window.__songMeta.artist,
+                            album: 'MetroLite 12',
+                            artwork: window.__songMeta.artwork ? [{ src: window.__songMeta.artwork, sizes: '320x180', type: 'image/jpeg' }] : []
+                        });
+                        navigator.mediaSession.playbackState = window.__userPaused ? 'paused' : 'playing';
+                        navigator.mediaSession.setActionHandler('play', function() {
+                            window.__userPaused = false;
+                            var v = document.querySelector('video');
+                            if (v) v.play();
+                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePlay' });
+                        });
+                        navigator.mediaSession.setActionHandler('pause', function() {
+                            window.__userPaused = true;
+                            var v = document.querySelector('video');
+                            if (v) v.pause();
+                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePause' });
+                        });
+                        navigator.mediaSession.setActionHandler('nexttrack', function() {
+                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remoteNext' });
+                        });
+                        navigator.mediaSession.setActionHandler('previoustrack', function() {
+                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'remotePrev' });
+                        });
+                    } catch(e) {}
+                }
+            };
             
             setInterval(function() {
                 var player = document.getElementById('movie_player');
@@ -148,6 +186,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         video.play().catch(function(e) {});
                     }
                     if (!video.paused && video.readyState >= 3 && video.currentTime > 0.05) {
+                        window.__applyWebMediaSession();
                         window.webkit.messageHandlers.nativeBridge.postMessage({
                             status: 'progress',
                             currentTime: video.currentTime || 0,
@@ -158,6 +197,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                             window.__reportedPlayingForSrc = sig;
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
                         }
+                    }
+                    // Deteksi akhir lagu secara akurat (baik lewat event ended maupun sisa durasi < 0.4 detik)
+                    if ((video.ended || (isFinite(video.duration) && video.duration > 5 && (video.duration - video.currentTime) <= 0.4)) && window.__reportedEndedForSrc !== video.src) {
+                        window.__reportedEndedForSrc = video.src;
+                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
                     }
                 }
 
@@ -171,10 +215,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         }
                     });
                     video.addEventListener('ended', function() {
-                        window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
+                        if (window.__reportedEndedForSrc !== video.src) {
+                            window.__reportedEndedForSrc = video.src;
+                            window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'ended' });
+                        }
                     });
                 }
-            }, 150);
+            }, 200);
         })();
         """
         let endScript = WKUserScript(source: endJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
@@ -207,6 +254,44 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         window.addSubview(webView)
     }
 
+    private func syncWebMetadata(song: SongItem) {
+        let safeTitle = song.title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+        let safeArtist = song.artist.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
+        let artURL = song.thumbnailURL?.absoluteString ?? ""
+        let js = """
+        window.__songMeta = { title: '\(safeTitle)', artist: '\(safeArtist)', artwork: '\(artURL)' };
+        if (window.__applyWebMediaSession) window.__applyWebMediaSession();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    // Memutar lagu sekaligus menyimpan daftar antrean aktif
+    func playFromQueue(songs: [SongItem], at index: Int) {
+        guard songs.indices.contains(index) else { return }
+        self.queue = songs
+        self.currentIndex = index
+        play(song: songs[index])
+    }
+
+    func playNext() {
+        guard !queue.isEmpty else { return }
+        let nextIndex = (currentIndex + 1) < queue.count ? (currentIndex + 1) : 0
+        currentIndex = nextIndex
+        play(song: queue[nextIndex])
+    }
+
+    func playPrevious() {
+        guard !queue.isEmpty else { return }
+        // Jika lagu sudah berjalan lebih dari 4 detik, tombol Previous mengulang dari awal lagu
+        if currentPlaybackTime > 4.0, let song = currentSong {
+            play(song: song)
+            return
+        }
+        let prevIndex = (currentIndex - 1) >= 0 ? (currentIndex - 1) : (queue.count - 1)
+        currentIndex = prevIndex
+        play(song: queue[prevIndex])
+    }
+
     func play(song: SongItem) {
         currentSong = song
         isPlaying = true
@@ -215,8 +300,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentDuration = 0
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
+        syncWebMetadata(song: song)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
-        webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = '';", completionHandler: nil)
+        webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = '';", completionHandler: nil)
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
             guard let self = self, self.currentSong?.videoId == song.videoId else { return }
@@ -231,6 +317,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             (function() {
                 window.__userPaused = false;
                 window.__reportedPlayingForSrc = '';
+                window.__reportedEndedForSrc = '';
                 var a = document.createElement('a');
                 a.href = '/watch?v=\(song.videoId)';
                 document.body.appendChild(a);
@@ -258,6 +345,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isPlayerPageLoaded = true
+        if let song = currentSong {
+            syncWebMetadata(song: song)
+        }
     }
 
     func togglePlayPause() {
@@ -273,6 +363,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
         }
+        syncWebMetadata(song: song)
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: currentArtworkImage)
         onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
@@ -287,21 +378,23 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         case "progress":
             if let ct = body["currentTime"] as? Double { currentPlaybackTime = ct }
             if let dur = body["duration"] as? Double { currentDuration = dur }
-        case "playing":
+        case "playing", "remotePlay":
             isPlaying = true
             updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        case "paused":
+        case "paused", "remotePause":
             isPlaying = false
             updateAnchorState()
             onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "ended":
-            isPlaying = false
-            updateAnchorState()
-            onStateChanged?(false, "Selesai: \(song.title)", currentArtworkImage)
-            updateNowPlayingInfo(song: song, image: currentArtworkImage)
+            // Otomatis lanjut ke lagu berikutnya saat lagu selesai diputar
+            playNext()
+        case "remoteNext":
+            playNext()
+        case "remotePrev":
+            playPrevious()
         default:
             break
         }
@@ -313,12 +406,20 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             try? AVAudioSession.sharedInstance().setActive(true)
             self.silentPlayer?.play()
             self.beginBackgroundTaskIfNeeded()
+            if let song = self.currentSong {
+                self.syncWebMetadata(song: song)
+                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
+            }
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.silentPlayer?.play()
+            if let song = self.currentSong {
+                self.syncWebMetadata(song: song)
+                self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
+            }
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
@@ -372,6 +473,16 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         commandCenter.togglePlayPauseCommand.isEnabled = true
         commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
             self?.togglePlayPause()
+            return .success
+        }
+        commandCenter.nextTrackCommand.isEnabled = true
+        commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+            self?.playNext()
+            return .success
+        }
+        commandCenter.previousTrackCommand.isEnabled = true
+        commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+            self?.playPrevious()
             return .success
         }
     }
