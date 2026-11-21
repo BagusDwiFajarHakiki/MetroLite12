@@ -36,7 +36,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // .mixWithOthers mencegah benturan interupsi antara silentPlayer dan stream WebKit saat Control Center dibuka
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
@@ -129,7 +128,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.__reportedEndedForSrc = "";
             window.__qualitySetForSrc = "";
             window.__savedTime = 0;
-            window.__activeVideoId = "";
             
             setInterval(function() {
                 var video = document.querySelector('video');
@@ -160,7 +158,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     if (video.muted) video.muted = false;
                     if (video.volume < 1.0) video.volume = 1.0;
 
-                    // Jika layar baru dikunci dan pemutar YouTube sempat me-reset posisi ke 0, kembalikan ke detik terakhir!
                     if (window.__savedTime > 3.0 && video.currentTime < 1.5 && video.readyState >= 2) {
                         try {
                             video.currentTime = window.__savedTime;
@@ -172,7 +169,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     }
 
                     if (!video.paused && video.readyState >= 3 && video.currentTime > 0.25) {
-                        // Simpan detik berjalan secara terus-menerus
                         if (video.currentTime >= window.__savedTime || (window.__savedTime - video.currentTime) < 2.0) {
                             window.__savedTime = video.currentTime;
                         }
@@ -200,7 +196,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     video.__hooked = true;
                     video.addEventListener('pause', function() {
                         if (!window.__userPaused && !video.ended) {
-                            // Pulihkan pemutaran langsung tanpa mereset currentTime
                             setTimeout(function() {
                                 if (!window.__userPaused && video.paused) {
                                     if (window.__savedTime > 3.0 && video.currentTime < 1.5) {
@@ -346,10 +341,12 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
             guard let self = self, self.currentSong?.videoId == song.videoId else { return }
-            self.currentArtworkImage = image
-            self.updateNowPlayingInfo(song: song, image: image)
+            // Render ulang ke kotak persegi 300x300 agar diterima oleh widget Lock Screen iOS 12
+            let squareArt = self.makeSquareArtwork(from: image)
+            self.currentArtworkImage = squareArt
+            self.updateNowPlayingInfo(song: song, image: squareArt)
             let statusText = self.isPlaying ? "\(song.title) - \(song.artist)" : "\(song.title)"
-            self.onStateChanged?(self.isPlaying, statusText, image)
+            self.onStateChanged?(self.isPlaying, statusText, squareArt)
         }
 
         if isPlayerPageLoaded {
@@ -375,6 +372,25 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         } else {
             loadWatchURL(videoId: song.videoId)
         }
+    }
+
+    private func makeSquareArtwork(from image: UIImage?) -> UIImage? {
+        guard let image = image else { return nil }
+        let targetSize = CGSize(width: 300, height: 300)
+        UIGraphicsBeginImageContextWithOptions(targetSize, true, 1.0)
+        let aspect = max(targetSize.width / image.size.width, targetSize.height / image.size.height)
+        let drawWidth = image.size.width * aspect
+        let drawHeight = image.size.height * aspect
+        let drawRect = CGRect(
+            x: (targetSize.width - drawWidth) / 2.0,
+            y: (targetSize.height - drawHeight) / 2.0,
+            width: drawWidth,
+            height: drawHeight
+        )
+        image.draw(in: drawRect)
+        let result = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return result ?? image
     }
 
     private func loadWatchURL(videoId: String) {
@@ -433,7 +449,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func setupLifecycleObservers() {
-        // Saat menarik Control Center (willResignActive), cukup pastikan audio session & silentPlayer hidup tanpa me-reset video
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.beginBackgroundTaskIfNeeded()
@@ -442,7 +457,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
         }
 
-        // Saat layar dimatikan (didEnterBackground), pulihkan pemutaran dari detik terakhir (__savedTime) tanpa mengulang dari awal
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             if self.silentPlayer?.isPlaying == false {
@@ -483,38 +497,55 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func updateNowPlayingInfo(song: SongItem, image: UIImage?) {
-        var info = [String: Any]()
-        info[MPMediaItemPropertyTitle] = song.title
-        info[MPMediaItemPropertyArtist] = song.artist
-        info[MPMediaItemPropertyPlaybackDuration] = currentDuration > 0 ? currentDuration : 180.0
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentPlaybackTime
-        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-        if let image = image {
-            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
-            info[MPMediaItemPropertyArtwork] = artwork
+        DispatchQueue.main.async {
+            var info = [String: Any]()
+            info[MPMediaItemPropertyTitle] = song.title
+            info[MPMediaItemPropertyArtist] = song.artist
+            info[MPMediaItemPropertyAlbumTitle] = "MetroLite 12"
+            info[MPMediaItemPropertyPlaybackDuration] = self.currentDuration > 0 ? self.currentDuration : 180.0
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.currentPlaybackTime
+            info[MPNowPlayingInfoPropertyPlaybackRate] = self.isPlaying ? 1.0 : 0.0
+            if let image = image {
+                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
+                info[MPMediaItemPropertyArtwork] = artwork
+            }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     private func setupRemoteCommands() {
         let commandCenter = MPRemoteCommandCenter.shared()
+
+        // Nonaktifkan tombol skip detik agar iOS 12 mengaktifkan tombol Next & Previous track di Lock Screen
+        commandCenter.skipForwardCommand.isEnabled = false
+        commandCenter.skipBackwardCommand.isEnabled = false
+
         commandCenter.playCommand.isEnabled = true
         commandCenter.playCommand.addTarget { [weak self] _ in
             guard let self = self else { return .commandFailed }
             if !self.isPlaying { self.togglePlayPause() }
             return .success
         }
+
         commandCenter.pauseCommand.isEnabled = true
         commandCenter.pauseCommand.addTarget { [weak self] _ in
             guard let self = self else { return .commandFailed }
             if self.isPlaying { self.togglePlayPause() }
             return .success
         }
+
+        commandCenter.togglePlayPauseCommand.isEnabled = true
+        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+            self?.togglePlayPause()
+            return .success
+        }
+
         commandCenter.nextTrackCommand.isEnabled = true
         commandCenter.nextTrackCommand.addTarget { [weak self] _ in
             self?.playNext()
             return .success
         }
+
         commandCenter.previousTrackCommand.isEnabled = true
         commandCenter.previousTrackCommand.addTarget { [weak self] _ in
             self?.playPrevious()

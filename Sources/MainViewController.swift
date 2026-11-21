@@ -50,11 +50,25 @@ class SongTableViewCell: UITableViewCell {
 // MARK: - Tab 1: Streaming
 class StreamingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate {
     private let searchBar = UISearchBar()
-    private let tableView = UITableView()
+    private let bannerContainer = UIView()
     private let statusBanner = UILabel()
+    private let exitQueueButton = UIButton(type: .system)
+    private let tableView = UITableView()
+    private let refreshControl = UIRefreshControl()
 
     private var songs: [SongItem] = []
+    private var browseSongs: [SongItem] = []
     private var isShowingRadioQueue = false
+    private var lastQuery = "Lagu Pop Indonesia Hits"
+
+    private let homeFeedQueries = [
+        "Lagu Pop Indonesia Hits",
+        "Musik Viral Indonesia Terbaru",
+        "Top Indo Acoustic Chill",
+        "Lagu Galau Indonesia Terbaik",
+        "Indonesian Indie Hits",
+        "Pop Barat Hits Terbaru"
+    ]
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -62,16 +76,16 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         view.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
         setupUI()
 
-        // Jika daftar antrean radio sejenis bertambah otomatis, tampilkan di daftar
         AudioPlayerManager.shared.onQueueUpdated = { [weak self] updatedQueue in
             guard let self = self else { return }
             self.songs = updatedQueue
             self.isShowingRadioQueue = true
+            self.exitQueueButton.isHidden = false
             self.statusBanner.text = "  Antrean Radio Sejenis (\(updatedQueue.count) lagu)"
             self.tableView.reloadData()
         }
 
-        performSearch(query: "Lagu Pop Indonesia Hits")
+        performSearch(query: lastQuery, isRefresh: false)
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -88,12 +102,28 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         searchBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchBar)
 
+        bannerContainer.backgroundColor = UIColor(white: 0.11, alpha: 1.0)
+        bannerContainer.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(bannerContainer)
+
         statusBanner.text = "  Memuat katalog..."
-        statusBanner.textColor = UIColor(white: 0.65, alpha: 1.0)
+        statusBanner.textColor = UIColor(white: 0.70, alpha: 1.0)
         statusBanner.font = UIFont.systemFont(ofSize: 12, weight: .medium)
-        statusBanner.backgroundColor = UIColor(white: 0.11, alpha: 1.0)
         statusBanner.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(statusBanner)
+        bannerContainer.addSubview(statusBanner)
+
+        exitQueueButton.setTitle("✕ Keluar", for: .normal)
+        exitQueueButton.titleLabel?.font = UIFont.systemFont(ofSize: 11, weight: .bold)
+        exitQueueButton.setTitleColor(.white, for: .normal)
+        exitQueueButton.backgroundColor = UIColor(red: 0.85, green: 0.25, blue: 0.25, alpha: 0.9)
+        exitQueueButton.layer.cornerRadius = 4
+        exitQueueButton.isHidden = true
+        exitQueueButton.addTarget(self, action: #selector(didTapExitQueue), for: .touchUpInside)
+        exitQueueButton.translatesAutoresizingMaskIntoConstraints = false
+        bannerContainer.addSubview(exitQueueButton)
+
+        refreshControl.tintColor = .white
+        refreshControl.addTarget(self, action: #selector(didPullToRefresh), for: .valueChanged)
 
         tableView.dataSource = self
         tableView.delegate = self
@@ -101,9 +131,9 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         tableView.rowHeight = 64
         tableView.backgroundColor = .clear
         tableView.separatorColor = UIColor(white: 0.18, alpha: 1.0)
-        // Beri ruang bawah 62pt agar baris terakhir tidak tertutup mini-player
         tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 62, right: 0)
         tableView.scrollIndicatorInsets = tableView.contentInset
+        tableView.refreshControl = refreshControl
         tableView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(tableView)
 
@@ -113,28 +143,71 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             searchBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             searchBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            statusBanner.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
-            statusBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            statusBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            statusBanner.heightAnchor.constraint(equalToConstant: 24),
+            bannerContainer.topAnchor.constraint(equalTo: searchBar.bottomAnchor),
+            bannerContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bannerContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bannerContainer.heightAnchor.constraint(equalToConstant: 28),
 
-            tableView.topAnchor.constraint(equalTo: statusBanner.bottomAnchor),
+            exitQueueButton.trailingAnchor.constraint(equalTo: bannerContainer.trailingAnchor, constant: -10),
+            exitQueueButton.centerYAnchor.constraint(equalTo: bannerContainer.centerYAnchor),
+            exitQueueButton.widthAnchor.constraint(equalToConstant: 64),
+            exitQueueButton.heightAnchor.constraint(equalToConstant: 20),
+
+            statusBanner.leadingAnchor.constraint(equalTo: bannerContainer.leadingAnchor, constant: 4),
+            statusBanner.trailingAnchor.constraint(equalTo: exitQueueButton.leadingAnchor, constant: -6),
+            statusBanner.centerYAnchor.constraint(equalTo: bannerContainer.centerYAnchor),
+
+            tableView.topAnchor.constraint(equalTo: bannerContainer.bottomAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: guide.bottomAnchor)
         ])
     }
 
-    private func performSearch(query: String) {
+    @objc private func didTapExitQueue() {
         isShowingRadioQueue = false
-        statusBanner.text = "  Mencari: \(query)..."
+        exitQueueButton.isHidden = true
+        if !browseSongs.isEmpty {
+            songs = browseSongs
+            statusBanner.text = "  Katalog Lagu (\(songs.count) lagu)"
+            tableView.reloadData()
+        } else {
+            performSearch(query: lastQuery, isRefresh: false)
+        }
+    }
+
+    @objc private func didPullToRefresh() {
+        // Pilih kata kunci baru dari daftar beranda (atau segarkan pencarian aktif)
+        if let typedText = searchBar.text, !typedText.trimmingCharacters(in: .whitespaces).isEmpty {
+            performSearch(query: typedText, isRefresh: true)
+        } else {
+            let candidates = homeFeedQueries.filter { $0 != lastQuery }
+            let nextFeedQuery = candidates.randomElement() ?? "Lagu Pop Indonesia Hits"
+            performSearch(query: nextFeedQuery, isRefresh: true)
+        }
+    }
+
+    private func performSearch(query: String, isRefresh: Bool) {
+        lastQuery = query
+        isShowingRadioQueue = false
+        exitQueueButton.isHidden = true
+        if !isRefresh {
+            statusBanner.text = "  Mencari: \(query)..."
+        }
+
         InnerTubeService.shared.searchSongs(query: query) { [weak self] results, errorMsg in
-            self?.songs = results
-            self?.tableView.reloadData()
+            guard let self = self else { return }
+            self.refreshControl.endRefreshing()
+
+            let finalResults = isRefresh ? results.shuffled() : results
+            self.songs = finalResults
+            self.browseSongs = finalResults
+            self.tableView.reloadData()
+
             if let errorMsg = errorMsg {
-                self?.statusBanner.text = "  \(errorMsg)"
+                self.statusBanner.text = "  \(errorMsg)"
             } else {
-                self?.statusBanner.text = "  Hasil pencarian (\(results.count) lagu)"
+                self.statusBanner.text = "  \(query) (\(finalResults.count) lagu)"
             }
         }
     }
@@ -147,7 +220,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
         searchBar.resignFirstResponder()
         guard let query = searchBar.text, !query.isEmpty else { return }
-        performSearch(query: query)
+        performSearch(query: query, isRefresh: false)
     }
 
     // MARK: - UITableViewDataSource & Delegate
@@ -178,10 +251,8 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         tableView.deselectRow(at: indexPath, animated: true)
         let selectedSong = songs[indexPath.row]
         if isShowingRadioQueue {
-            // Jika mengklik dari antrean radio yang sudah ada, langsung lompat ke lagu tersebut
             AudioPlayerManager.shared.playFromQueue(songs: songs, at: indexPath.row)
         } else {
-            // Jika mengklik hasil pencarian baru, bangun antrean radio lagu-lagu yang sejenis
             AudioPlayerManager.shared.startRadioWithSong(selectedSong)
         }
         tableView.reloadData()
@@ -254,7 +325,6 @@ class RootTabBarController: UITabBarController {
         viewControllers = [nav1, nav2]
     }
 
-    // Membuat ikon sederhana bawaan untuk TabBar iOS 12 tanpa bergantung SF Symbols (iOS 13+)
     private func makeTabIcon(systemFallback symbol: String) -> UIImage? {
         let size = CGSize(width: 24, height: 24)
         UIGraphicsBeginImageContextWithOptions(size, false, 0)
