@@ -42,6 +42,24 @@ class InnerTubeService {
     static let shared = InnerTubeService()
     private init() {}
 
+    // Menyimpan URL googlevideo.com (audio/mp4) bersih yang berhasil ditangkap dari WKWebView saat lagu diputar
+    private var capturedStreamCache: [String: URL] = [:]
+
+    func cacheCapturedAudioURL(_ rawURLString: String, for videoId: String) {
+        guard !videoId.isEmpty,
+              rawURLString.contains("googlevideo.com/videoplayback"),
+              rawURLString.contains("mime=audio") else { return }
+
+        // Hapus parameter &range=... dan &rn=... agar URL mengunduh file utuh dari byte 0
+        guard var components = URLComponents(string: rawURLString) else { return }
+        let excludedParams: Set<String> = ["range", "rn", "rbuf", "ump", "srfvp"]
+        components.queryItems = components.queryItems?.filter { !excludedParams.contains($0.name) }
+
+        if let cleanURL = components.url {
+            capturedStreamCache[videoId] = cleanURL
+        }
+    }
+
     private let webContext: [String: Any] = [
         "client": [
             "clientName": "WEB_REMIX",
@@ -123,9 +141,32 @@ class InnerTubeService {
         }.resume()
     }
 
-    // Ekstraksi URL audio langsung dengan multi-fallback + laporan error diagnostik
-    func fetchDirectAudioURL(videoId: String, completion: @escaping (URL?, String, String?) -> Void) {
-        let candidates: [(client: [String: Any], userAgent: String, clientId: String)] = [
+    // Prioritas 1: Gunakan URL yang sudah berhasil diputar WKWebView.
+    // Prioritas 2: Gunakan klien TVHTML5_SIMPLY_EMBEDDED_PLAYER (bebas wajib PO Token).
+    func fetchDirectAudioURL(videoId: String, completion: @escaping (URL?, String, String, String?) -> Void) {
+        let mobileUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 12_5_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1.2 Mobile/15E148 Safari/604.1"
+        if let capturedURL = capturedStreamCache[videoId] {
+            DispatchQueue.main.async {
+                completion(capturedURL, mobileUA, "https://m.youtube.com/", nil)
+            }
+            return
+        }
+
+        let candidates: [(client: [String: Any], thirdParty: [String: Any]?, userAgent: String, referer: String, clientId: String)] = [
+            (
+                client: [
+                    "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                    "clientVersion": "2.0",
+                    "hl": "id",
+                    "gl": "ID"
+                ],
+                thirdParty: [
+                    "embedUrl": "https://www.youtube.com/"
+                ],
+                userAgent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+                referer: "https://www.youtube.com/",
+                clientId: "85"
+            ),
             (
                 client: [
                     "clientName": "ANDROID_VR",
@@ -138,22 +179,10 @@ class InnerTubeService {
                     "hl": "id",
                     "gl": "ID"
                 ],
+                thirdParty: nil,
                 userAgent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                referer: "https://www.youtube.com/",
                 clientId: "28"
-            ),
-            (
-                client: [
-                    "clientName": "IOS",
-                    "clientVersion": "20.10.4",
-                    "deviceMake": "Apple",
-                    "deviceModel": "iPhone16,2",
-                    "osName": "iOS",
-                    "osVersion": "18.3.2.22D82",
-                    "hl": "id",
-                    "gl": "ID"
-                ],
-                userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)",
-                clientId: "5"
             )
         ]
 
@@ -162,19 +191,14 @@ class InnerTubeService {
 
     private func tryFetchAudioWithClient(
         videoId: String,
-        candidates: [(client: [String: Any], userAgent: String, clientId: String)],
+        candidates: [(client: [String: Any], thirdParty: [String: Any]?, userAgent: String, referer: String, clientId: String)],
         index: Int,
         lastError: String?,
-        completion: @escaping (URL?, String, String?) -> Void
+        completion: @escaping (URL?, String, String, String?) -> Void
     ) {
-        guard candidates.indices.contains(index) else {
-            // Cadangan terakhir: ambil ytInitialPlayerResponse langsung dari halaman HTML m.youtube.com
-            fetchAudioFromMobileHTML(videoId: videoId, fallbackError: lastError, completion: completion)
-            return
-        }
-
-        guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
-            DispatchQueue.main.async { completion(nil, "", "URL player tidak valid") }
+        guard candidates.indices.contains(index),
+              let url = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+            DispatchQueue.main.async { completion(nil, "", "", lastError ?? "Stream tidak tersedia") }
             return
         }
 
@@ -184,14 +208,20 @@ class InnerTubeService {
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        request.setValue(current.referer, forHTTPHeaderField: "Referer")
         request.setValue(current.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(current.clientId, forHTTPHeaderField: "X-YouTube-Client-Name")
         if let ver = current.client["clientVersion"] as? String {
             request.setValue(ver, forHTTPHeaderField: "X-YouTube-Client-Version")
         }
 
+        var contextDict: [String: Any] = ["client": current.client]
+        if let tp = current.thirdParty {
+            contextDict["thirdParty"] = tp
+        }
+
         let body: [String: Any] = [
-            "context": ["client": current.client],
+            "context": contextDict,
             "videoId": videoId,
             "contentCheckOk": true,
             "racyCheckOk": true
@@ -207,51 +237,15 @@ class InnerTubeService {
             let httpCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                self?.tryFetchAudioWithClient(videoId: videoId, candidates: candidates, index: index + 1, lastError: "HTTP \(httpCode) JSON kosong", completion: completion)
+                self?.tryFetchAudioWithClient(videoId: videoId, candidates: candidates, index: index + 1, lastError: "HTTP \(httpCode)", completion: completion)
                 return
             }
 
             if let streamURL = self?.extractStreamURLFromPlayerJSON(json) {
-                DispatchQueue.main.async { completion(streamURL, current.userAgent, nil) }
+                DispatchQueue.main.async { completion(streamURL, current.userAgent, current.referer, nil) }
             } else {
                 let playability = (json["playabilityStatus"] as? [String: Any])?["status"] as? String ?? "NO_STREAM"
                 self?.tryFetchAudioWithClient(videoId: videoId, candidates: candidates, index: index + 1, lastError: "Status: \(playability)", completion: completion)
-            }
-        }.resume()
-    }
-
-    private func fetchAudioFromMobileHTML(videoId: String, fallbackError: String?, completion: @escaping (URL?, String, String?) -> Void) {
-        let mobileUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 12_5_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1.2 Mobile/15E148 Safari/604.1"
-        guard let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)") else {
-            DispatchQueue.main.async { completion(nil, "", fallbackError ?? "URL tidak valid") }
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 20
-        request.setValue(mobileUA, forHTTPHeaderField: "User-Agent")
-        request.setValue("id-ID,id;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
-            guard let data = data, let html = String(data: data, encoding: .utf8) else {
-                DispatchQueue.main.async { completion(nil, "", error?.localizedDescription ?? fallbackError ?? "Gagal memuat HTML") }
-                return
-            }
-
-            // Ekstrak JSON ytInitialPlayerResponse dari skrip halaman
-            if let range = html.range(of: "ytInitialPlayerResponse = "),
-               let endRange = html[range.upperBound...].range(of: ";</script>") {
-                let jsonStr = String(html[range.upperBound..<endRange.lowerBound])
-                if let jsonData = jsonStr.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                   let streamURL = self?.extractStreamURLFromPlayerJSON(json) {
-                    DispatchQueue.main.async { completion(streamURL, mobileUA, nil) }
-                    return
-                }
-            }
-
-            DispatchQueue.main.async {
-                completion(nil, "", fallbackError ?? "Stream terkunci cipher")
             }
         }.resume()
     }
@@ -261,7 +255,6 @@ class InnerTubeService {
         let adaptiveFormats = streamingData["adaptiveFormats"] as? [[String: Any]] ?? []
         let formats = streamingData["formats"] as? [[String: Any]] ?? []
 
-        // 1. Prioritaskan audio/mp4 (m4a / AAC) dengan direct URL
         for fmt in adaptiveFormats {
             if let mime = fmt["mimeType"] as? String,
                mime.contains("audio/mp4"),
@@ -272,7 +265,6 @@ class InnerTubeService {
             }
         }
 
-        // 2. Cadangan: audio format lain dengan direct URL
         for fmt in adaptiveFormats {
             if let mime = fmt["mimeType"] as? String,
                mime.contains("audio/"),
@@ -283,7 +275,6 @@ class InnerTubeService {
             }
         }
 
-        // 3. Cadangan terakhir: video/mp4 gabungan audio+video
         for fmt in formats {
             if let mime = fmt["mimeType"] as? String,
                mime.contains("video/mp4"),

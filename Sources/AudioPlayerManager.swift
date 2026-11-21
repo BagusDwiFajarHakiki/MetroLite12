@@ -315,6 +315,20 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     if (window.__reportedPlayingForSig !== sig) {
                         window.__reportedPlayingForSig = sig;
                         window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
+                        try {
+                            var entries = performance.getEntriesByType('resource');
+                            for (var i = entries.length - 1; i >= 0; i--) {
+                                var u = entries[i].name || "";
+                                if (u.indexOf('googlevideo.com/videoplayback') !== -1 && u.indexOf('mime=audio') !== -1) {
+                                    window.webkit.messageHandlers.nativeBridge.postMessage({
+                                        status: 'capturedStream',
+                                        videoId: window.__targetVideoId,
+                                        url: u
+                                    });
+                                    break;
+                                }
+                            }
+                        } catch(e) {}
                     }
                 }
 
@@ -328,6 +342,20 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     video.addEventListener('play', function() {
                         window.__userPaused = false;
                         window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'playing' });
+                        try {
+                            var entries = performance.getEntriesByType('resource');
+                            for (var i = entries.length - 1; i >= 0; i--) {
+                                var u = entries[i].name || "";
+                                if (u.indexOf('googlevideo.com/videoplayback') !== -1 && u.indexOf('mime=audio') !== -1) {
+                                    window.webkit.messageHandlers.nativeBridge.postMessage({
+                                        status: 'capturedStream',
+                                        videoId: window.__targetVideoId,
+                                        url: u
+                                    });
+                                    break;
+                                }
+                            }
+                        } catch(e) {}
                     });
                     video.addEventListener('pause', function() {
                         if (video.ended) {
@@ -703,6 +731,11 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             lastUserPauseTimestamp = Date()
             onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
+        case "capturedStream":
+            if let vid = body["videoId"] as? String,
+            let streamStr = body["url"] as? String {
+                InnerTubeService.shared.cacheCapturedAudioURL(streamStr, for: vid)
+            }
         case "ended":
             if !isTransitioningTrack {
                 isTransitioningTrack = true

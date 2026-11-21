@@ -1,4 +1,5 @@
 import UIKit
+import WebKit
 
 struct SavedSongItem: Codable {
     let videoId: String
@@ -164,28 +165,44 @@ class PlaylistStorageManager {
         downloadingIds.insert(song.videoId)
         notifyStateUpdated()
 
-        InnerTubeService.shared.fetchDirectAudioURL(videoId: song.videoId) { [weak self] streamURL, matchedUserAgent, errorReason in
+        InnerTubeService.shared.fetchDirectAudioURL(videoId: song.videoId) { [weak self] streamURL, matchedUserAgent, referer, errorReason in
             guard let self = self else { return }
             guard let streamURL = streamURL else {
                 self.downloadingIds.remove(song.videoId)
-                self.downloadErrors[song.videoId] = errorReason ?? "URL stream kosong"
+                self.downloadErrors[song.videoId] = errorReason ?? "Stream kosong"
                 self.notifyStateUpdated()
                 return
             }
 
-            // Unduh menggunakan chunked HTTP Range agar tidak ditolak server googlevideo.com
-            self.downloadInChunks(videoId: song.videoId, url: streamURL, userAgent: matchedUserAgent, startByte: 0, accumulatedData: Data())
+            // Salin cookie aktif dari WKWebView ke HTTPCookieStorage sebelum mengunduh
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                for cookie in cookies {
+                    HTTPCookieStorage.shared.setCookie(cookie)
+                }
+                self.downloadInChunks(
+                    videoId: song.videoId,
+                    url: streamURL,
+                    userAgent: matchedUserAgent,
+                    referer: referer,
+                    startByte: 0,
+                    accumulatedData: Data()
+                )
+            }
         }
     }
 
-    private func downloadInChunks(videoId: String, url: URL, userAgent: String, startByte: Int, accumulatedData: Data) {
-        let chunkSize = 512 * 1024 // 512 KB per permintaan Range
+    private func downloadInChunks(videoId: String, url: URL, userAgent: String, referer: String, startByte: Int, accumulatedData: Data) {
+        let chunkSize = 512 * 1024
         let endByte = startByte + chunkSize - 1
 
         var req = URLRequest(url: url)
         req.timeoutInterval = 30
         if !userAgent.isEmpty {
             req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        }
+        if !referer.isEmpty {
+            req.setValue(referer, forHTTPHeaderField: "Referer")
+            req.setValue("https://m.youtube.com", forHTTPHeaderField: "Origin")
         }
         req.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
 
@@ -194,7 +211,7 @@ class PlaylistStorageManager {
 
             if let error = error {
                 self.downloadingIds.remove(videoId)
-                self.downloadErrors[videoId] = "Gagal unduh: \(error.localizedDescription)"
+                self.downloadErrors[videoId] = "Gagal: \(error.localizedDescription)"
                 self.notifyStateUpdated()
                 return
             }
@@ -212,7 +229,6 @@ class PlaylistStorageManager {
             var updatedData = accumulatedData
             updatedData.append(chunk)
 
-            // Cek total ukuran file dari header Content-Range (format: bytes 0-524287/3456789)
             var totalExpectedBytes: Int? = nil
             if let contentRange = httpResp?.allHeaderFields["Content-Range"] as? String,
                let slashIndex = contentRange.lastIndex(of: "/") {
@@ -241,7 +257,7 @@ class PlaylistStorageManager {
                 self.downloadingIds.remove(videoId)
                 self.notifyStateUpdated()
             } else {
-                self.downloadInChunks(videoId: videoId, url: url, userAgent: userAgent, startByte: updatedData.count, accumulatedData: updatedData)
+                self.downloadInChunks(videoId: videoId, url: url, userAgent: userAgent, referer: referer, startByte: updatedData.count, accumulatedData: updatedData)
             }
         }.resume()
     }
