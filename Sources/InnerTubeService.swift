@@ -4,6 +4,7 @@ struct SongItem {
     let videoId: String
     let title: String
     let artist: String
+    let duration: String
     var thumbnailURL: URL? {
         return URL(string: "https://i.ytimg.com/vi/\(videoId)/mqdefault.jpg")
     }
@@ -13,7 +14,7 @@ class ImageLoader {
     static let shared = ImageLoader()
     private let cache = NSCache<NSString, UIImage>()
     private init() {
-        cache.countLimit = 60
+        cache.countLimit = 80
     }
 
     func loadImage(from url: URL?, completion: @escaping (UIImage?) -> Void) {
@@ -90,7 +91,6 @@ class InnerTubeService {
         }.resume()
     }
 
-    // Mengambil daftar lagu sejenis (Up Next / Radio) berdasarkan videoId lagu yang sedang/baru diputar
     func fetchRelatedSongs(videoId: String, completion: @escaping ([SongItem]) -> Void) {
         guard let url = URL(string: "https://music.youtube.com/youtubei/v1/next?prettyPrint=false") else {
             completion([])
@@ -114,7 +114,7 @@ class InnerTubeService {
             }
 
             var results: [SongItem] = []
-            var seenIds: Set<String> = [videoId] // Hindari mengulang lagu yang barusan diputar
+            var seenIds: Set<String> = [videoId]
             self.extractRelatedRecursively(from: json, results: &results, seenIds: &seenIds)
 
             DispatchQueue.main.async {
@@ -139,9 +139,10 @@ class InnerTubeService {
                 if let videoId = extractVideoId(from: itemRenderer), !seenIds.contains(videoId),
                    let flexColumns = itemRenderer["flexColumns"] as? [[String: Any]] {
                     let title = extractText(from: flexColumns, index: 0) ?? "Unknown Title"
-                    let artist = extractText(from: flexColumns, index: 1) ?? "YouTube Music"
+                    let rawMeta = extractText(from: flexColumns, index: 1) ?? "YouTube Music"
+                    let parsed = parseArtistAndDuration(from: rawMeta)
                     seenIds.insert(videoId)
-                    results.append(SongItem(videoId: videoId, title: title, artist: artist))
+                    results.append(SongItem(videoId: videoId, title: title, artist: parsed.artist, duration: parsed.duration))
                 }
             }
             for (_, value) in dict {
@@ -154,18 +155,19 @@ class InnerTubeService {
         }
     }
 
-    // Parser khusus panel Up Next (playlistPanelVideoRenderer) dari endpoint /next
     private func extractRelatedRecursively(from node: Any, results: inout [SongItem], seenIds: inout Set<String>) {
         if let dict = node as? [String: Any] {
             if let panelVideo = dict["playlistPanelVideoRenderer"] as? [String: Any],
                let videoId = panelVideo["videoId"] as? String,
                !seenIds.contains(videoId) {
                 let title = extractRunsText(from: panelVideo["title"]) ?? "Unknown Title"
-                let artist = extractRunsText(from: panelVideo["longBylineText"])
+                let rawByline = extractRunsText(from: panelVideo["longBylineText"])
                     ?? extractRunsText(from: panelVideo["shortBylineText"])
                     ?? "YouTube Music"
+                let durationText = extractRunsText(from: panelVideo["lengthText"]) ?? ""
+                let parsed = parseArtistAndDuration(from: rawByline, fallbackDuration: durationText)
                 seenIds.insert(videoId)
-                results.append(SongItem(videoId: videoId, title: title, artist: artist))
+                results.append(SongItem(videoId: videoId, title: title, artist: parsed.artist, duration: parsed.duration))
             }
             for (_, value) in dict {
                 extractRelatedRecursively(from: value, results: &results, seenIds: &seenIds)
@@ -175,6 +177,31 @@ class InnerTubeService {
                 extractRelatedRecursively(from: element, results: &results, seenIds: &seenIds)
             }
         }
+    }
+
+    // Memisahkan nama artis dan durasi (format mm:ss) serta membuang tahun rilis/label tipe
+    private func parseArtistAndDuration(from raw: String, fallbackDuration: String = "") -> (artist: String, duration: String) {
+        let parts = raw.components(separatedBy: "•").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        var foundDuration = fallbackDuration
+        var cleanArtistParts: [String] = []
+
+        let ignoredLabels: Set<String> = ["Lagu", "Song", "Video", "Single", "Album", "EP"]
+
+        for part in parts {
+            // Cek apakah bagian ini adalah durasi (contoh: 3:45 atau 1:02:10)
+            if part.range(of: #"^\d{1,2}:\d{2}(:\d{2})?$"#, options: .regularExpression) != nil {
+                foundDuration = part
+                continue
+            }
+            // Abaikan tahun 4 digit (contoh: 2024, 2026) atau label kategori
+            if part.range(of: #"^(19|20)\d{2}$"#, options: .regularExpression) != nil || ignoredLabels.contains(part) {
+                continue
+            }
+            cleanArtistParts.append(part)
+        }
+
+        let artistName = cleanArtistParts.first ?? (parts.first ?? "YouTube Music")
+        return (artistName, foundDuration)
     }
 
     private func extractRunsText(from obj: Any?) -> String? {

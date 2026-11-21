@@ -1,9 +1,61 @@
 import UIKit
 
-class SongTableViewCell: UITableViewCell {
+// MARK: - Cell Grid 2 Kolom untuk Halaman Awal / Pencarian
+class SongGridCollectionViewCell: UICollectionViewCell {
     let thumbImageView = UIImageView()
     let titleLabel = UILabel()
     let artistLabel = UILabel()
+    var currentVideoId: String?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        contentView.backgroundColor = UIColor(white: 0.12, alpha: 1.0)
+        contentView.layer.cornerRadius = 8
+        contentView.clipsToBounds = true
+
+        thumbImageView.contentMode = .scaleAspectFill
+        thumbImageView.clipsToBounds = true
+        thumbImageView.backgroundColor = UIColor(white: 0.18, alpha: 1.0)
+        thumbImageView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(thumbImageView)
+
+        titleLabel.textColor = .white
+        titleLabel.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.numberOfLines = 2
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(titleLabel)
+
+        artistLabel.textColor = .lightGray
+        artistLabel.font = UIFont.systemFont(ofSize: 11, weight: .regular)
+        artistLabel.numberOfLines = 1
+        artistLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(artistLabel)
+
+        NSLayoutConstraint.activate([
+            thumbImageView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            thumbImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            thumbImageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            thumbImageView.heightAnchor.constraint(equalTo: contentView.widthAnchor, multiplier: 0.72),
+
+            titleLabel.topAnchor.constraint(equalTo: thumbImageView.bottomAnchor, constant: 6),
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 8),
+            titleLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8),
+
+            artistLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
+            artistLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            artistLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            artistLabel.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -6)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// MARK: - Cell Baris untuk Halaman Antrean (Menampilkan Artis & Durasi)
+class SongTableViewCell: UITableViewCell {
+    let thumbImageView = UIImageView()
+    let titleLabel = UILabel()
+    let subtitleLabel = UILabel()
     var currentVideoId: String?
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
@@ -23,10 +75,10 @@ class SongTableViewCell: UITableViewCell {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(titleLabel)
 
-        artistLabel.textColor = .lightGray
-        artistLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
-        artistLabel.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(artistLabel)
+        subtitleLabel.textColor = .lightGray
+        subtitleLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(subtitleLabel)
 
         NSLayoutConstraint.activate([
             thumbImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
@@ -38,24 +90,25 @@ class SongTableViewCell: UITableViewCell {
             titleLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -14),
             titleLabel.topAnchor.constraint(equalTo: thumbImageView.topAnchor, constant: 4),
 
-            artistLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            artistLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            artistLabel.bottomAnchor.constraint(equalTo: thumbImageView.bottomAnchor, constant: -4)
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            subtitleLabel.bottomAnchor.constraint(equalTo: thumbImageView.bottomAnchor, constant: -4)
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - Tab 1: Streaming
-class StreamingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate {
+// MARK: - Tab 1: Streaming (Grid 2 Kolom di Halaman Awal, Baris di Antrean)
+class StreamingViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate {
     private let searchBar = UISearchBar()
     private let statusBanner = UILabel()
+    private var collectionView: UICollectionView!
     private let tableView = UITableView()
-    private let refreshControl = UIRefreshControl()
+    private let gridRefreshControl = UIRefreshControl()
 
-    private var songs: [SongItem] = []
     private var browseSongs: [SongItem] = []
+    private var queueSongs: [SongItem] = []
     private var isShowingRadioQueue = false
     private var lastQuery = "Lagu Pop Indonesia Hits"
 
@@ -76,11 +129,14 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
 
         AudioPlayerManager.shared.onQueueUpdated = { [weak self] updatedQueue in
             guard let self = self else { return }
-            self.songs = updatedQueue
-            self.isShowingRadioQueue = true
-            self.updateBackButtonVisibility()
-            self.statusBanner.text = "  Antrean Radio Sejenis (\(updatedQueue.count) lagu)"
-            self.tableView.reloadData()
+            self.queueSongs = updatedQueue
+            self.switchToQueueMode(true)
+        }
+
+        AudioPlayerManager.shared.onOpenQueueRequested = { [weak self] currentQueue in
+            guard let self = self else { return }
+            self.queueSongs = currentQueue
+            self.switchToQueueMode(true)
         }
 
         performSearch(query: lastQuery, isRefresh: false)
@@ -88,7 +144,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        tableView.reloadData()
+        refreshActiveList()
     }
 
     private func setupUI() {
@@ -97,6 +153,7 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         searchBar.barStyle = .black
         searchBar.isTranslucent = false
         searchBar.barTintColor = UIColor(white: 0.10, alpha: 1.0)
+        searchBar.tintColor = .white
         searchBar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchBar)
 
@@ -107,9 +164,27 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         statusBanner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(statusBanner)
 
-        refreshControl.tintColor = .white
-        refreshControl.addTarget(self, action: #selector(didPullToRefresh), for: .valueChanged)
+        // 1. Setup Grid 2 Kolom (Halaman Awal & Pencarian)
+        let layout = UICollectionViewFlowLayout()
+        layout.minimumInteritemSpacing = 10
+        layout.minimumLineSpacing = 12
+        layout.sectionInset = UIEdgeInsets(top: 10, left: 12, bottom: 70, right: 12)
 
+        collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        collectionView.dataSource = self
+        collectionView.delegate = self
+        collectionView.register(SongGridCollectionViewCell.self, forCellWithReuseIdentifier: "GridCell")
+        collectionView.backgroundColor = .clear
+        collectionView.alwaysBounceVertical = true
+        collectionView.keyboardDismissMode = .onDrag
+        collectionView.translatesAutoresizingMaskIntoConstraints = false
+
+        gridRefreshControl.tintColor = .white
+        gridRefreshControl.addTarget(self, action: #selector(didPullToRefresh), for: .valueChanged)
+        collectionView.refreshControl = gridRefreshControl
+        view.addSubview(collectionView)
+
+        // 2. Setup Baris List (Halaman Antrean Radio)
         tableView.dataSource = self
         tableView.delegate = self
         tableView.register(SongTableViewCell.self, forCellReuseIdentifier: "SongCell")
@@ -118,7 +193,8 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         tableView.separatorColor = UIColor(white: 0.18, alpha: 1.0)
         tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 62, right: 0)
         tableView.scrollIndicatorInsets = tableView.contentInset
-        tableView.refreshControl = refreshControl
+        tableView.keyboardDismissMode = .onDrag
+        tableView.isHidden = true
         tableView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(tableView)
 
@@ -133,11 +209,32 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
             statusBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             statusBanner.heightAnchor.constraint(equalToConstant: 26),
 
+            collectionView.topAnchor.constraint(equalTo: statusBanner.bottomAnchor),
+            collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            collectionView.bottomAnchor.constraint(equalTo: guide.bottomAnchor),
+
             tableView.topAnchor.constraint(equalTo: statusBanner.bottomAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: guide.bottomAnchor)
         ])
+    }
+
+    private func switchToQueueMode(_ enabled: Bool) {
+        isShowingRadioQueue = enabled
+        updateBackButtonVisibility()
+        if enabled {
+            collectionView.isHidden = true
+            tableView.isHidden = false
+            statusBanner.text = "  Antrean Radio Sejenis (\(queueSongs.count) lagu)"
+            tableView.reloadData()
+        } else {
+            tableView.isHidden = true
+            collectionView.isHidden = false
+            statusBanner.text = "  \(lastQuery) (\(browseSongs.count) lagu)"
+            collectionView.reloadData()
+        }
     }
 
     private func makeBackChevronIcon(size: CGSize) -> UIImage? {
@@ -168,12 +265,9 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
     }
 
     @objc private func didTapExitQueue() {
-        isShowingRadioQueue = false
-        updateBackButtonVisibility()
+        searchBar.resignFirstResponder()
         if !browseSongs.isEmpty {
-            songs = browseSongs
-            statusBanner.text = "  \(lastQuery) (\(songs.count) lagu)"
-            tableView.reloadData()
+            switchToQueueMode(false)
         } else {
             performSearch(query: lastQuery, isRefresh: false)
         }
@@ -193,18 +287,19 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         lastQuery = query
         isShowingRadioQueue = false
         updateBackButtonVisibility()
+        tableView.isHidden = true
+        collectionView.isHidden = false
         if !isRefresh {
             statusBanner.text = "  Mencari: \(query)..."
         }
 
         InnerTubeService.shared.searchSongs(query: query) { [weak self] results, errorMsg in
             guard let self = self else { return }
-            self.refreshControl.endRefreshing()
+            self.gridRefreshControl.endRefreshing()
 
             let finalResults = isRefresh ? results.shuffled() : results
-            self.songs = finalResults
             self.browseSongs = finalResults
-            self.tableView.reloadData()
+            self.collectionView.reloadData()
 
             if let errorMsg = errorMsg {
                 self.statusBanner.text = "  \(errorMsg)"
@@ -214,25 +309,46 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         }
     }
 
-    func refreshTable() {
-        tableView.reloadData()
+    func refreshActiveList() {
+        if isShowingRadioQueue {
+            tableView.reloadData()
+        } else {
+            collectionView.reloadData()
+        }
     }
 
-    // MARK: - UISearchBarDelegate
+    // MARK: - UISearchBarDelegate (Tutup keyboard responsif)
+    func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
+        searchBar.setShowsCancelButton(true, animated: true)
+    }
+
+    func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+        searchBar.setShowsCancelButton(false, animated: true)
+        searchBar.resignFirstResponder()
+    }
+
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
+        searchBar.setShowsCancelButton(false, animated: true)
         searchBar.resignFirstResponder()
         guard let query = searchBar.text, !query.isEmpty else { return }
         performSearch(query: query, isRefresh: false)
     }
 
-    // MARK: - UITableViewDataSource & Delegate
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return songs.count
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        if searchBar.isFirstResponder {
+            searchBar.setShowsCancelButton(false, animated: true)
+            searchBar.resignFirstResponder()
+        }
     }
 
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "SongCell", for: indexPath) as! SongTableViewCell
-        let song = songs[indexPath.row]
+    // MARK: - UICollectionViewDataSource & FlowLayout (Grid 2 Kolom Halaman Awal)
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        return browseSongs.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "GridCell", for: indexPath) as! SongGridCollectionViewCell
+        let song = browseSongs[indexPath.item]
         cell.currentVideoId = song.videoId
         cell.titleLabel.text = song.title
         cell.artistLabel.text = song.artist
@@ -249,14 +365,53 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         return cell
     }
 
+    func collectionView(_ collectionView: UICollectionView, layout collectionViewLayout: UICollectionViewLayout, sizeForItemAt indexPath: IndexPath) -> CGSize {
+        let totalHorizontalPadding: CGFloat = 12 + 12 + 10
+        let cardWidth = floor((collectionView.bounds.width - totalHorizontalPadding) / 2.0)
+        let cardHeight = floor(cardWidth * 0.72) + 56
+        return CGSize(width: cardWidth, height: cardHeight)
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        searchBar.setShowsCancelButton(false, animated: true)
+        searchBar.resignFirstResponder()
+        let selectedSong = browseSongs[indexPath.item]
+        AudioPlayerManager.shared.startRadioWithSong(selectedSong)
+    }
+
+    // MARK: - UITableViewDataSource & Delegate (Daftar Baris Antrean + Durasi)
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        return queueSongs.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "SongCell", for: indexPath) as! SongTableViewCell
+        let song = queueSongs[indexPath.row]
+        cell.currentVideoId = song.videoId
+        cell.titleLabel.text = song.title
+        if song.duration.isEmpty {
+            cell.subtitleLabel.text = song.artist
+        } else {
+            cell.subtitleLabel.text = "\(song.artist) • \(song.duration)"
+        }
+        cell.thumbImageView.image = nil
+
+        let isCurrent = AudioPlayerManager.shared.currentSong?.videoId == song.videoId
+        cell.titleLabel.textColor = isCurrent ? UIColor(red: 0.2, green: 0.85, blue: 0.45, alpha: 1.0) : .white
+
+        ImageLoader.shared.loadImage(from: song.thumbnailURL) { image in
+            if cell.currentVideoId == song.videoId {
+                cell.thumbImageView.image = image
+            }
+        }
+        return cell
+    }
+
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        let selectedSong = songs[indexPath.row]
-        if isShowingRadioQueue {
-            AudioPlayerManager.shared.playFromQueue(songs: songs, at: indexPath.row)
-        } else {
-            AudioPlayerManager.shared.startRadioWithSong(selectedSong)
-        }
+        searchBar.setShowsCancelButton(false, animated: true)
+        searchBar.resignFirstResponder()
+        AudioPlayerManager.shared.playFromQueue(songs: queueSongs, at: indexPath.row)
         tableView.reloadData()
     }
 }
@@ -299,7 +454,7 @@ class RootTabBarController: UITabBarController {
             if let artwork = artwork {
                 self.miniThumbView.image = artwork
             }
-            self.streamingVC.refreshTable()
+            self.streamingVC.refreshActiveList()
         }
     }
 
@@ -409,7 +564,10 @@ class RootTabBarController: UITabBarController {
         nowPlayingLabel.text = "Pilih lagu untuk mulai"
         nowPlayingLabel.textColor = .white
         nowPlayingLabel.font = UIFont.systemFont(ofSize: 13, weight: .medium)
+        nowPlayingLabel.isUserInteractionEnabled = true
         nowPlayingLabel.translatesAutoresizingMaskIntoConstraints = false
+        let tapTitleGesture = UITapGestureRecognizer(target: self, action: #selector(didTapMiniPlayerTitle))
+        nowPlayingLabel.addGestureRecognizer(tapTitleGesture)
         playerBar.addSubview(nowPlayingLabel)
 
         playPauseButton.setImage(playIcon, for: .normal)
@@ -454,6 +612,11 @@ class RootTabBarController: UITabBarController {
             nowPlayingLabel.centerYAnchor.constraint(equalTo: playerBar.centerYAnchor),
             nowPlayingLabel.trailingAnchor.constraint(equalTo: playPauseButton.leadingAnchor, constant: -8)
         ])
+    }
+
+    @objc private func didTapMiniPlayerTitle() {
+        selectedIndex = 0
+        AudioPlayerManager.shared.reopenCurrentQueue()
     }
 
     @objc private func didTapPlayPause() {

@@ -23,6 +23,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     var onStateChanged: ((Bool, String, UIImage?) -> Void)?
     var onQueueUpdated: (([SongItem]) -> Void)?
+    var onOpenQueueRequested: (([SongItem]) -> Void)?
     private var currentArtworkImage: UIImage?
     private var currentPlaybackTime: Double = 0
     private var currentDuration: Double = 0
@@ -77,7 +78,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         }
     }
 
-    // Timer cadangan tingkat native Swift agar auto-next tetap berjalan tepat waktu saat layar mati
     private func startNativeAutoNextWatchdog() {
         nativeAutoNextTimer?.invalidate()
         nativeAutoNextTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -271,10 +271,19 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         window.addSubview(webView)
     }
 
+    func reopenCurrentQueue() {
+        if !queue.isEmpty {
+            onOpenQueueRequested?(queue)
+        } else if let song = currentSong {
+            startRadioWithSong(song)
+        }
+    }
+
     func startRadioWithSong(_ song: SongItem) {
         playedHistory = [song.videoId]
         queue = [song]
         currentIndex = 0
+        onQueueUpdated?(queue)
         play(song: song)
 
         InnerTubeService.shared.fetchRelatedSongs(videoId: song.videoId) { [weak self] related in
@@ -381,7 +390,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             self.onStateChanged?(self.isPlaying, statusText, squareArt)
         }
 
-        // Jika layar mati (background), muat URL secara langsung agar tidak tertahan throttling SPA WebKit
         let isInBackground = UIApplication.shared.applicationState != .active
         if isPlayerPageLoaded && !isInBackground {
             let spaNavigateJS = """
