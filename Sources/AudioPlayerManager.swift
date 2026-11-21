@@ -75,7 +75,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
 
     private func updateAnchorState() {
         if isPlaying {
-            try? AVAudioSession.sharedInstance().setActive(true)
             if silentPlayer?.isPlaying == false {
                 silentPlayer?.play()
             }
@@ -125,15 +124,34 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             window.__userPaused = false;
             window.__reportedPlayingForSrc = "";
             window.__reportedEndedForSrc = "";
+            window.__qualitySetForSrc = "";
             
             setInterval(function() {
-                var player = document.getElementById('movie_player');
-                if (player && player.setPlaybackQualityRange) {
-                    try { player.setPlaybackQualityRange('tiny', 'tiny'); } catch(e) {}
-                }
-
                 var video = document.querySelector('video');
                 if (!video) return;
+
+                // Atur kualitas 144p HANYA sekali saat sumber video baru dimuat agar tidak memutus audio di detik awal
+                if (video.src && window.__qualitySetForSrc !== video.src) {
+                    var player = document.getElementById('movie_player');
+                    if (player && player.setPlaybackQualityRange) {
+                        try {
+                            player.setPlaybackQualityRange('tiny', 'tiny');
+                            window.__qualitySetForSrc = video.src;
+                        } catch(e) {}
+                    }
+                }
+
+                // Lewati segmen iklan pre-roll dalam keadaan bisu jika muncul
+                var isAd = document.querySelector('.ad-showing, .ad-interrupting') !== null;
+                if (isAd) {
+                    video.muted = true;
+                    if (isFinite(video.duration) && video.duration > 0) {
+                        video.currentTime = video.duration;
+                    }
+                    var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+                    if (skipBtn) skipBtn.click();
+                    return;
+                }
 
                 if (!window.__userPaused) {
                     if (video.muted) video.muted = false;
@@ -141,7 +159,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     if (video.paused && !video.ended && video.readyState >= 2) {
                         video.play().catch(function(e) {});
                     }
-                    if (!video.paused && video.readyState >= 3 && video.currentTime > 0.05) {
+                    // Tunggu buffer stabil (readyState >= 3 dan currentTime > 0.25) agar tidak terputus setelah dilaporkan playing
+                    if (!video.paused && video.readyState >= 3 && video.currentTime > 0.25) {
                         window.webkit.messageHandlers.nativeBridge.postMessage({
                             status: 'progress',
                             currentTime: video.currentTime || 0,
@@ -208,7 +227,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         window.addSubview(webView)
     }
 
-    // Memulai pemutaran dari lagu yang dipilih dan langsung memuat daftar lagu sejenis (Radio)
     func startRadioWithSong(_ song: SongItem) {
         playedHistory = [song.videoId]
         queue = [song]
@@ -244,12 +262,10 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             playedHistory.insert(nextSong.videoId)
             play(song: nextSong)
 
-            // Jika sudah mendekati akhir antrean (sisa 2 lagu), muat lagi lagu sejenis berikutnya
             if queue.count - nextIndex <= 2 {
                 fetchMoreRelated(basedOn: nextSong)
             }
         } else if let lastSong = currentSong {
-            // Jika antrean habis, ambil lagu sejenis baru dari lagu terakhir
             onStateChanged?(true, "Mencari lagu sejenis...", currentArtworkImage)
             InnerTubeService.shared.fetchRelatedSongs(videoId: lastSong.videoId) { [weak self] related in
                 guard let self = self else { return }
@@ -297,7 +313,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         updateAnchorState()
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
-        webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = '';", completionHandler: nil)
+        webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__qualitySetForSrc = '';", completionHandler: nil)
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
             guard let self = self, self.currentSong?.videoId == song.videoId else { return }
@@ -313,6 +329,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 window.__userPaused = false;
                 window.__reportedPlayingForSrc = '';
                 window.__reportedEndedForSrc = '';
+                window.__qualitySetForSrc = '';
                 var a = document.createElement('a');
                 a.href = '/watch?v=\(song.videoId)';
                 document.body.appendChild(a);
@@ -371,7 +388,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
             isPlaying = true
-            updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
