@@ -140,13 +140,27 @@ class StreamingViewController: UIViewController, UITableViewDataSource, UITableV
         ])
     }
 
+    private func makeBackChevronIcon(size: CGSize) -> UIImage? {
+        UIGraphicsBeginImageContextWithOptions(size, false, 0)
+        guard let ctx = UIGraphicsGetCurrentContext() else { return nil }
+        ctx.setStrokeColor(UIColor.white.cgColor)
+        ctx.setLineWidth(2.4)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        ctx.move(to: CGPoint(x: size.width * 0.65, y: size.height * 0.20))
+        ctx.addLine(to: CGPoint(x: size.width * 0.28, y: size.height * 0.50))
+        ctx.addLine(to: CGPoint(x: size.width * 0.65, y: size.height * 0.80))
+        ctx.strokePath()
+        let img = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
+        UIGraphicsEndImageContext()
+        return img
+    }
+
     private func updateBackButtonVisibility() {
         if isShowingRadioQueue {
-            let backBtn = UIBarButtonItem(title: "<", style: .plain, target: self, action: #selector(didTapExitQueue))
-            backBtn.setTitleTextAttributes([
-                .font: UIFont.systemFont(ofSize: 22, weight: .bold),
-                .foregroundColor: UIColor.white
-            ], for: .normal)
+            let backIcon = makeBackChevronIcon(size: CGSize(width: 22, height: 22))
+            let backBtn = UIBarButtonItem(image: backIcon, style: .plain, target: self, action: #selector(didTapExitQueue))
+            backBtn.tintColor = .white
             navigationItem.leftBarButtonItem = backBtn
         } else {
             navigationItem.leftBarButtonItem = nil
