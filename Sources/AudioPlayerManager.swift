@@ -36,7 +36,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // Wajib pakai .mixWithOthers agar silentPlayer dan WKWebView tidak saling memutus setiap detik
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
@@ -71,16 +70,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             player.volume = 0.01
             player.prepareToPlay()
             silentPlayer = player
-        }
-    }
-
-    private func updateAnchorState() {
-        if isPlaying {
-            if silentPlayer?.isPlaying == false {
-                silentPlayer?.play()
-            }
-        } else {
-            silentPlayer?.pause()
+            // Jalankan anchor player secara permanen sejak aplikasi dibuka agar tidak terjadi re-init audio hardware saat ganti lagu/kunci layar
+            silentPlayer?.play()
         }
     }
 
@@ -94,13 +85,25 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let contentController = WKUserContentController()
         contentController.add(self, name: "nativeBridge")
 
+        // 1. Pencegatan tingkat prototype (.atDocumentStart) agar WebKit/YouTube tidak bisa menjeda video pada 0ms saat layar dimatikan atau awal pemuatan
         let startJS = """
         (function() {
+            window.__userPaused = false;
+
             try {
                 var exp = Date.now() + 2592000000;
                 localStorage.setItem('yt-player-quality', JSON.stringify({ data: 'tiny', expiration: exp, creation: Date.now() }));
                 localStorage.setItem('yt-player-av1-pref', '144');
             } catch(e) {}
+
+            // Blokir panggilan .pause() otomatis dari sistem/WebKit saat layar dimatikan atau inisialisasi awal
+            var origPause = HTMLMediaElement.prototype.pause;
+            HTMLMediaElement.prototype.pause = function() {
+                if (window.__userPaused || this.ended) {
+                    return origPause.apply(this, arguments);
+                }
+                // Abaikan perintah pause otomatis dari WebKit/YouTube saat user tidak menekan Pause
+            };
 
             Object.defineProperty(document, 'hidden', { get: function() { return false; } });
             Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; } });
@@ -121,27 +124,16 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         let startScript = WKUserScript(source: startJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         contentController.addUserScript(startScript)
 
+        // 2. Pengawasan pemutaran mulus tanpa mengubah kualitas di tengah jalan (menghindari re-buffer 1 detik di awal)
         let endJS = """
         (function() {
-            window.__userPaused = false;
             window.__reportedPlayingForSrc = "";
             window.__reportedEndedForSrc = "";
-            window.__qualitySetForSrc = "";
             window.__savedTime = 0;
             
             setInterval(function() {
                 var video = document.querySelector('video');
                 if (!video) return;
-
-                if (video.src && window.__qualitySetForSrc !== video.src) {
-                    var player = document.getElementById('movie_player');
-                    if (player && player.setPlaybackQualityRange) {
-                        try {
-                            player.setPlaybackQualityRange('tiny', 'tiny');
-                            window.__qualitySetForSrc = video.src;
-                        } catch(e) {}
-                    }
-                }
 
                 var isAd = document.querySelector('.ad-showing, .ad-interrupting') !== null;
                 if (isAd) {
@@ -168,7 +160,8 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         video.play().catch(function(e) {});
                     }
 
-                    if (!video.paused && video.readyState >= 3 && video.currentTime > 0.25) {
+                    // Tunggu buffer benar-benar penuh (readyState === 4 / HAVE_ENOUGH_DATA) sebelum status memuat dihilangkan
+                    if (!video.paused && video.readyState >= 4 && video.currentTime > 0.35) {
                         if (video.currentTime >= window.__savedTime || (window.__savedTime - video.currentTime) < 2.0) {
                             window.__savedTime = video.currentTime;
                         }
@@ -196,14 +189,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                     video.__hooked = true;
                     video.addEventListener('pause', function() {
                         if (!window.__userPaused && !video.ended) {
-                            setTimeout(function() {
-                                if (!window.__userPaused && video.paused) {
-                                    if (window.__savedTime > 3.0 && video.currentTime < 1.5) {
-                                        try { video.currentTime = window.__savedTime; } catch(e) {}
-                                    }
-                                    video.play().catch(function(e) {});
-                                }
-                            }, 30);
+                            video.play().catch(function(e) {});
                         } else if (window.__userPaused) {
                             window.webkit.messageHandlers.nativeBridge.postMessage({ status: 'paused' });
                         }
@@ -216,7 +202,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                         }
                     });
                 }
-            }, 250);
+            }, 150);
         })();
         """
         let endScript = WKUserScript(source: endJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
@@ -332,11 +318,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentArtworkImage = nil
         currentPlaybackTime = 0
         currentDuration = 0
-        updateAnchorState()
+        if silentPlayer?.isPlaying == false {
+            silentPlayer?.play()
+        }
         updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         
-        let resetJS = "window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__qualitySetForSrc = ''; window.__savedTime = 0;"
+        let resetJS = "window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = ''; window.__savedTime = 0;"
         webView.evaluateJavaScript(resetJS, completionHandler: nil)
 
         ImageLoader.shared.loadImage(from: song.thumbnailURL) { [weak self] image in
@@ -354,7 +342,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
                 window.__userPaused = false;
                 window.__reportedPlayingForSrc = '';
                 window.__reportedEndedForSrc = '';
-                window.__qualitySetForSrc = '';
                 window.__savedTime = 0;
                 var a = document.createElement('a');
                 a.href = '/watch?v=\(song.videoId)';
@@ -417,7 +404,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             }
             isPlaying = true
         }
-        updateAnchorState()
         updateNowPlayingInfo(song: song, image: currentArtworkImage)
         onStateChanged?(isPlaying, "\(song.title) - \(song.artist)", currentArtworkImage)
     }
@@ -433,12 +419,10 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
             isPlaying = true
-            updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
             isPlaying = false
-            updateAnchorState()
             onStateChanged?(false, "\(song.title) - \(song.artist)", currentArtworkImage)
             updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "ended":
@@ -452,32 +436,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.beginBackgroundTaskIfNeeded()
-            if self.silentPlayer?.isPlaying == false {
-                self.silentPlayer?.play()
-            }
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            if self.silentPlayer?.isPlaying == false {
-                self.silentPlayer?.play()
-            }
             if let song = self.currentSong {
                 self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
             }
-            let resumeJS = """
-            (function() {
-                window.__userPaused = false;
-                var v = document.querySelector('video');
-                if (v) {
-                    if (window.__savedTime > 3.0 && v.currentTime < 1.5) {
-                        try { v.currentTime = window.__savedTime; } catch(e) {}
-                    }
-                    if (v.paused) v.play().catch(function(e) {});
-                }
-            })();
-            """
-            self.webView.evaluateJavaScript(resumeJS, completionHandler: nil)
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
