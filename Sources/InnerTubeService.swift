@@ -13,7 +13,7 @@ class ImageLoader {
     static let shared = ImageLoader()
     private let cache = NSCache<NSString, UIImage>()
     private init() {
-        cache.countLimit = 60 // Batasi cache maksimal 60 gambar agar RAM iPhone 5s tetap lega
+        cache.countLimit = 60
     }
 
     func loadImage(from url: URL?, completion: @escaping (UIImage?) -> Void) {
@@ -56,19 +56,12 @@ class InnerTubeService {
             return
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
-        request.setValue("https://music.youtube.com/", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
-
+        var request = makeBaseRequest(url: url)
         let body: [String: Any] = [
             "context": webContext,
             "query": query,
             "params": "EgWKAQIIAWoKEAMQBBAJEAoQBQ%3D%3D"
         ]
-
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         URLSession.shared.dataTask(with: request) { data, response, error in
@@ -76,7 +69,6 @@ class InnerTubeService {
                 DispatchQueue.main.async { completion([], "Error jaringan: \(error.localizedDescription)") }
                 return
             }
-
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 DispatchQueue.main.async { completion([], "Gagal membaca JSON dari server") }
@@ -98,6 +90,49 @@ class InnerTubeService {
         }.resume()
     }
 
+    // Mengambil daftar lagu sejenis (Up Next / Radio) berdasarkan videoId lagu yang sedang/baru diputar
+    func fetchRelatedSongs(videoId: String, completion: @escaping ([SongItem]) -> Void) {
+        guard let url = URL(string: "https://music.youtube.com/youtubei/v1/next?prettyPrint=false") else {
+            completion([])
+            return
+        }
+
+        var request = makeBaseRequest(url: url)
+        let body: [String: Any] = [
+            "context": webContext,
+            "videoId": videoId,
+            "playlistId": "RDAMVM\(videoId)",
+            "isAudioOnly": true
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                DispatchQueue.main.async { completion([]) }
+                return
+            }
+
+            var results: [SongItem] = []
+            var seenIds: Set<String> = [videoId] // Hindari mengulang lagu yang barusan diputar
+            self.extractRelatedRecursively(from: json, results: &results, seenIds: &seenIds)
+
+            DispatchQueue.main.async {
+                completion(results)
+            }
+        }.resume()
+    }
+
+    private func makeBaseRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://music.youtube.com/", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
     private func extractSongsRecursively(from node: Any, results: inout [SongItem], seenIds: inout Set<String>) {
         if let dict = node as? [String: Any] {
             if let itemRenderer = dict["musicResponsiveListItemRenderer"] as? [String: Any] {
@@ -117,6 +152,36 @@ class InnerTubeService {
                 extractSongsRecursively(from: element, results: &results, seenIds: &seenIds)
             }
         }
+    }
+
+    // Parser khusus panel Up Next (playlistPanelVideoRenderer) dari endpoint /next
+    private func extractRelatedRecursively(from node: Any, results: inout [SongItem], seenIds: inout Set<String>) {
+        if let dict = node as? [String: Any] {
+            if let panelVideo = dict["playlistPanelVideoRenderer"] as? [String: Any],
+               let videoId = panelVideo["videoId"] as? String,
+               !seenIds.contains(videoId) {
+                let title = extractRunsText(from: panelVideo["title"]) ?? "Unknown Title"
+                let artist = extractRunsText(from: panelVideo["longBylineText"])
+                    ?? extractRunsText(from: panelVideo["shortBylineText"])
+                    ?? "YouTube Music"
+                seenIds.insert(videoId)
+                results.append(SongItem(videoId: videoId, title: title, artist: artist))
+            }
+            for (_, value) in dict {
+                extractRelatedRecursively(from: value, results: &results, seenIds: &seenIds)
+            }
+        } else if let array = node as? [Any] {
+            for element in array {
+                extractRelatedRecursively(from: element, results: &results, seenIds: &seenIds)
+            }
+        }
+    }
+
+    private func extractRunsText(from obj: Any?) -> String? {
+        guard let dict = obj as? [String: Any],
+              let runs = dict["runs"] as? [[String: Any]] else { return nil }
+        let text = runs.compactMap { $0["text"] as? String }.joined()
+        return text.isEmpty ? nil : text
     }
 
     private func extractVideoId(from renderer: [String: Any]) -> String? {

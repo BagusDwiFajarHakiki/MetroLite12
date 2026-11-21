@@ -6,10 +6,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         window = UIWindow(frame: UIScreen.main.bounds)
-        let nav = UINavigationController(rootViewController: MainViewController())
-        nav.navigationBar.barStyle = .black
-        nav.navigationBar.tintColor = .white
-        window?.rootViewController = nav
+        window?.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
+        window?.rootViewController = RootTabBarController()
         window?.makeKeyAndVisible()
         return true
     }

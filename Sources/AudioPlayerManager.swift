@@ -8,17 +8,18 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     
     private var webView: WKWebView!
     private var silentPlayer: AVAudioPlayer?
-    private var nowPlayingTimer: Timer?
     private(set) var isPlaying = false
     private(set) var currentSong: SongItem?
     
     private(set) var queue: [SongItem] = []
     private(set) var currentIndex: Int = -1
+    private var playedHistory = Set<String>()
     
     private var isPlayerPageLoaded = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     
     var onStateChanged: ((Bool, String, UIImage?) -> Void)?
+    var onQueueUpdated: (([SongItem]) -> Void)?
     private var currentArtworkImage: UIImage?
     private var currentPlaybackTime: Double = 0
     private var currentDuration: Double = 0
@@ -36,7 +37,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true, options: [])
+            try session.setActive(true)
             UIApplication.shared.beginReceivingRemoteControlEvents()
         } catch {
             print("AudioSession error: \(error)")
@@ -62,54 +63,24 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         header.append(withUnsafeBytes(of: Int16(16).littleEndian) { Data($0) })
         header.append("data".data(using: .ascii)!)
         header.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-
-        var pcmData = Data(capacity: Int(dataSize))
-        for i in 0..<Int(numSamples) {
-            let angle = 2.0 * Double.pi * 10.0 * Double(i) / Double(sampleRate)
-            let sample = Int16(sin(angle) * 18.0)
-            pcmData.append(withUnsafeBytes(of: sample.littleEndian) { Data($0) })
-        }
-        header.append(pcmData)
+        header.append(Data(count: Int(dataSize)))
 
         if let player = try? AVAudioPlayer(data: header) {
             player.numberOfLoops = -1
-            player.volume = 0.08
+            player.volume = 0.01
             player.prepareToPlay()
             silentPlayer = player
         }
     }
 
-    // Merebut kembali kepemilikan Now Playing dari proses WebKit.WebContent
-    private func reclaimNowPlayingFocus() {
-        guard isPlaying else { return }
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-        try? AVAudioSession.sharedInstance().setActive(true)
-        silentPlayer?.pause()
-        silentPlayer?.play()
-        if let song = currentSong {
-            updateNowPlayingInfo(song: song, image: currentArtworkImage)
-        }
-    }
-
     private func updateAnchorState() {
         if isPlaying {
-            reclaimNowPlayingFocus()
-            startNowPlayingKeepAlive()
+            try? AVAudioSession.sharedInstance().setActive(true)
+            if silentPlayer?.isPlaying == false {
+                silentPlayer?.play()
+            }
         } else {
             silentPlayer?.pause()
-            nowPlayingTimer?.invalidate()
-            nowPlayingTimer = nil
-        }
-    }
-
-    private func startNowPlayingKeepAlive() {
-        nowPlayingTimer?.invalidate()
-        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.isPlaying, let song = self.currentSong else { return }
-            if self.silentPlayer?.isPlaying == false {
-                self.silentPlayer?.play()
-            }
-            self.updateNowPlayingInfo(song: song, image: self.currentArtworkImage)
         }
     }
 
@@ -237,18 +208,73 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         window.addSubview(webView)
     }
 
+    // Memulai pemutaran dari lagu yang dipilih dan langsung memuat daftar lagu sejenis (Radio)
+    func startRadioWithSong(_ song: SongItem) {
+        playedHistory = [song.videoId]
+        queue = [song]
+        currentIndex = 0
+        play(song: song)
+
+        InnerTubeService.shared.fetchRelatedSongs(videoId: song.videoId) { [weak self] related in
+            guard let self = self, self.currentSong?.videoId == song.videoId else { return }
+            let filtered = related.filter { !self.playedHistory.contains($0.videoId) }
+            if !filtered.isEmpty {
+                self.queue = [song] + filtered
+                self.currentIndex = 0
+                self.onQueueUpdated?(self.queue)
+            }
+        }
+    }
+
     func playFromQueue(songs: [SongItem], at index: Int) {
         guard songs.indices.contains(index) else { return }
         self.queue = songs
         self.currentIndex = index
-        play(song: songs[index])
+        let selected = songs[index]
+        playedHistory.insert(selected.videoId)
+        play(song: selected)
     }
 
     func playNext() {
         guard !queue.isEmpty else { return }
-        let nextIndex = (currentIndex + 1) < queue.count ? (currentIndex + 1) : 0
-        currentIndex = nextIndex
-        play(song: queue[nextIndex])
+        let nextIndex = currentIndex + 1
+        if nextIndex < queue.count {
+            currentIndex = nextIndex
+            let nextSong = queue[nextIndex]
+            playedHistory.insert(nextSong.videoId)
+            play(song: nextSong)
+
+            // Jika sudah mendekati akhir antrean (sisa 2 lagu), muat lagi lagu sejenis berikutnya
+            if queue.count - nextIndex <= 2 {
+                fetchMoreRelated(basedOn: nextSong)
+            }
+        } else if let lastSong = currentSong {
+            // Jika antrean habis, ambil lagu sejenis baru dari lagu terakhir
+            onStateChanged?(true, "Mencari lagu sejenis...", currentArtworkImage)
+            InnerTubeService.shared.fetchRelatedSongs(videoId: lastSong.videoId) { [weak self] related in
+                guard let self = self else { return }
+                let fresh = related.filter { !self.playedHistory.contains($0.videoId) }
+                let candidates = fresh.isEmpty ? related : fresh
+                guard let firstNext = candidates.first else { return }
+                self.queue.append(contentsOf: candidates)
+                self.currentIndex += 1
+                self.playedHistory.insert(firstNext.videoId)
+                self.onQueueUpdated?(self.queue)
+                self.play(song: firstNext)
+            }
+        }
+    }
+
+    private func fetchMoreRelated(basedOn song: SongItem) {
+        InnerTubeService.shared.fetchRelatedSongs(videoId: song.videoId) { [weak self] related in
+            guard let self = self else { return }
+            let existingIds = Set(self.queue.map { $0.videoId })
+            let newItems = related.filter { !existingIds.contains($0.videoId) }
+            if !newItems.isEmpty {
+                self.queue.append(contentsOf: newItems)
+                self.onQueueUpdated?(self.queue)
+            }
+        }
     }
 
     func playPrevious() {
@@ -257,7 +283,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             play(song: song)
             return
         }
-        let prevIndex = (currentIndex - 1) >= 0 ? (currentIndex - 1) : (queue.count - 1)
+        let prevIndex = (currentIndex - 1) >= 0 ? (currentIndex - 1) : 0
         currentIndex = prevIndex
         play(song: queue[prevIndex])
     }
@@ -269,6 +295,7 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         currentPlaybackTime = 0
         currentDuration = 0
         updateAnchorState()
+        updateNowPlayingInfo(song: song, image: nil)
         onStateChanged?(true, "Memuat: \(song.title)...", nil)
         webView.evaluateJavaScript("window.__userPaused = false; window.__reportedPlayingForSrc = ''; window.__reportedEndedForSrc = '';", completionHandler: nil)
 
@@ -344,12 +371,9 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
             if let dur = body["duration"] as? Double { currentDuration = dur }
         case "playing":
             isPlaying = true
-            // Rebut kembali fokus Now Playing sesaat setelah stream WebKit mulai bersuara
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.reclaimNowPlayingFocus()
-            }
             updateAnchorState()
             onStateChanged?(true, "\(song.title) - \(song.artist)", currentArtworkImage)
+            updateNowPlayingInfo(song: song, image: currentArtworkImage)
         case "paused":
             isPlaying = false
             updateAnchorState()
@@ -366,16 +390,13 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
             self.beginBackgroundTaskIfNeeded()
-            self.reclaimNowPlayingFocus()
+            self.silentPlayer?.play()
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
         NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self, self.isPlaying else { return }
-            // Panggil ulang reclaimFocus setelah layar benar-benar terkunci agar SpringBoard mempertahankan widget
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.reclaimNowPlayingFocus()
-            }
+            self.silentPlayer?.play()
             self.webView.evaluateJavaScript("window.__userPaused = false; var v = document.querySelector('video'); if(v && v.paused) v.play();", completionHandler: nil)
         }
 
@@ -399,20 +420,17 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private func updateNowPlayingInfo(song: SongItem, image: UIImage?) {
-        DispatchQueue.main.async {
-            var info = [String: Any]()
-            info[MPMediaItemPropertyTitle] = song.title
-            info[MPMediaItemPropertyArtist] = song.artist
-            info[MPMediaItemPropertyAlbumTitle] = "MetroLite 12"
-            info[MPMediaItemPropertyPlaybackDuration] = self.currentDuration > 0 ? self.currentDuration : 180.0
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.currentPlaybackTime
-            info[MPNowPlayingInfoPropertyPlaybackRate] = self.isPlaying ? 1.0 : 0.0
-            if let image = image {
-                let artwork = MPMediaItemArtwork(boundsSize: CGSize(width: 300, height: 300)) { _ in return image }
-                info[MPMediaItemPropertyArtwork] = artwork
-            }
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        var info = [String: Any]()
+        info[MPMediaItemPropertyTitle] = song.title
+        info[MPMediaItemPropertyArtist] = song.artist
+        info[MPMediaItemPropertyPlaybackDuration] = currentDuration > 0 ? currentDuration : 180.0
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentPlaybackTime
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        if let image = image {
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in return image }
+            info[MPMediaItemPropertyArtwork] = artwork
         }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     private func setupRemoteCommands() {
@@ -427,11 +445,6 @@ class AudioPlayerManager: NSObject, WKNavigationDelegate, WKScriptMessageHandler
         commandCenter.pauseCommand.addTarget { [weak self] _ in
             guard let self = self else { return .commandFailed }
             if self.isPlaying { self.togglePlayPause() }
-            return .success
-        }
-        commandCenter.togglePlayPauseCommand.isEnabled = true
-        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
-            self?.togglePlayPause()
             return .success
         }
         commandCenter.nextTrackCommand.isEnabled = true
